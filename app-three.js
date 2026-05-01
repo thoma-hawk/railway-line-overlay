@@ -1,0 +1,1019 @@
+// Railway Line Waves — rails + lane sim, with wobble & ink trap shape effects.
+//
+// Stripped to: lane simulator (sim.js) + rail bodies + per-rail Y wobble +
+// ink trap hills. No sleepers, stations, patches, gradients, grain, presets.
+//
+// Loaded as a non-module <script>; THREE comes from the CDN global.
+
+// Hard cap on the number of distinct rail "layers" the shader carries.
+// Mirrors the GLSL `#define MAX_LANE_BUCKETS` and bounds the laneColors
+// uniform array.
+const MAX_LANE_BUCKETS = 9;
+
+// HSL-spread defaults so each lane has a distinct hue out of the box. The
+// user can override any one via the Lane colors pickers.
+function defaultLaneColors(n) {
+  const out = [];
+  const c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    c.setHSL(i / n, 0.62, 0.5);
+    out.push('#' + c.getHexString());
+  }
+  return out;
+}
+
+// Curated palettes — name → array of MAX_LANE_BUCKETS hex colours. Picking
+// one in the dropdown copies these straight into CONFIG.laneColors.
+const PALETTES = {
+  pastel: ['#ffadad','#ffd6a5','#fdffb6','#caffbf','#9bf6ff','#a0c4ff','#bdb2ff','#ffc6ff','#fffffc'],
+  neon:   ['#ff006e','#fb5607','#ffbe0b','#06ffa5','#00b4d8','#3a86ff','#8338ec','#ff4d6d','#9d4edd'],
+  earth:  ['#3a2e1f','#6f4e37','#a0522d','#cd853f','#deb887','#d2b48c','#bc8f8f','#f5deb3','#fff8dc'],
+  sunset: ['#03071e','#370617','#6a040f','#9d0208','#d00000','#dc2f02','#e85d04','#f48c06','#ffba08'],
+  ocean:  ['#03045e','#023e8a','#0077b6','#0096c7','#00b4d8','#48cae4','#90e0ef','#ade8f4','#caf0f8'],
+  mono:   ['#0e0e0e','#262626','#3d3d3d','#555555','#6e6e6e','#888888','#a3a3a3','#bfbfbf','#dcdcdc'],
+};
+
+// ── Config ────────────────────────────────────────────────────────────────
+const CONFIG = {
+  speed:        0,        // world units / second — advances cameraX
+  viewZoom:     0.57,
+  segW:         1500,     // segment width in world units (matches SIM.SEG_W)
+  laneSpace:    216,      // vertical distance between lanes
+  railWidth:    4,        // rail half-thickness in world units
+  // Soft body profile. railSoft = 0 → crisp SDF; 1 → full Gaussian halo.
+  // railSigma = Gaussian sigma as a fraction of the rail half-width.
+  railSoft:     0.19,
+  railSigma:    0.61,
+  railOpacity:  1.0,
+  bgColor:      '#f4f3ea',
+
+  // Per-lane hue blending — each rail (owner-lane group) gets a distinct
+  // color and is composited onto the running destination using the chosen
+  // blend mode. Layering shows up where rails overlap (split/merge zones).
+  blendMode:    'normal',  // normal | multiply | screen | darken | lighten
+                           // | overlay | difference | plus-lighter
+  laneColors:   defaultLaneColors(MAX_LANE_BUCKETS),
+
+  // Palette HSL spread — hue offset wraps the spread around the colour
+  // wheel; sat/light are applied uniformly. Editing any of these regenerates
+  // CONFIG.laneColors from the HSL formula. Editing an individual swatch
+  // overrides that one rail until the next regenerate.
+  paletteHueOffset: 0.0,
+  paletteSat:       0.62,
+  paletteLight:     0.5,
+
+  // ── Ticks — periodic gaps along every rail. Useful as a visual anchor
+  // and as a zoetrope/wagon-wheel target: at speed = tickSpacing × frame
+  // rate the gaps appear stationary; at small offsets they crawl forward
+  // or backward like a strobed wheel.
+  tickAmount:    0,        // 0 = no gaps, 1 = full clear gap at each tick
+  tickSpacing:   100,      // world units between ticks
+  tickWidth:     30,       // gap width in world units (along the rail)
+
+  // ── Ink traps — periodic asymmetric hills along each rail ────────────
+  // Per-rail random pattern (hash of segment idx × lane Y). Each trap
+  // shifts the rail's edge by a Gaussian profile so the rail "swells" out.
+  inkTrapAmount:    0,        // peak hill height (world units; 0 = off)
+  inkTrapSpacing:   1050,     // average distance between trap candidates
+  inkTrapDensity:   0.45,     // 0..1 — probability a candidate slot fires
+  inkTrapWidth:     368,      // hill half-width (world units)
+  inkTrapDirection: 0.28,     // 0 = all upward, 1 = all downward, 0.5 = mixed
+
+  // Simulation
+  simMode:      'procedural',  // 'scripted' | 'procedural'
+  simScript:    'v1',
+  loopSegs:     30,
+  seed:         1,
+  mergeChance:  0.20,
+  splitChance:  0.17,
+  maxTracks:    9,
+
+  // PNG sequence export
+  exportFrames: 120,
+  exportFps:    30,
+};
+
+// Snapshot of the baked-in defaults — used by the "Revert to defaults"
+// button. Cloned now (before any user mutation) so future changes to CONFIG
+// don't leak in.
+const DEFAULT_CONFIG = JSON.parse(JSON.stringify(CONFIG));
+
+// ── Simulator init ───────────────────────────────────────────────────────
+SIM.setScript(CONFIG.simScript);
+SIM.setLoopSegs(CONFIG.loopSegs);
+SIM.setSegW(CONFIG.segW);
+SIM.setLaneSpace(CONFIG.laneSpace);
+SIM.setCenterY(0);
+SIM.setSeed(CONFIG.seed);
+SIM.setMergeChance(CONFIG.mergeChance);
+SIM.setSplitChance(CONFIG.splitChance);
+SIM.setMaxTracks(CONFIG.maxTracks);
+SIM.setMode(CONFIG.simMode);
+
+const WORLD = {
+  cameraX:       0,
+  bufferSegs:    33,
+  // Must be ≥ MAX_LANE_BUCKETS / SIM.MAX_RAILS — at saturation each segment
+  // emits one conn per rail (plus one trunk-continuation if a SPLIT fires
+  // that turn, but cap on rails ensures we never exceed MAX_LANE_BUCKETS).
+  maxSlots:      MAX_LANE_BUCKETS,
+  laneOriginSeg: 0,
+};
+
+// ── Three.js setup ───────────────────────────────────────────────────────
+const canvas   = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(new THREE.Color(CONFIG.bgColor));
+
+const scene  = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Lane data — Float RGBA texture (MAX_SLOTS × BUFFER_SEGS) ─────────────
+// Each pixel (slot, seg) encodes one bezier connection:
+//   .r = segment start X in world units (absolute)
+//   .g = world Y of this connection's start lane
+//   .b = world Y of this connection's end lane
+//   .a = 0 if invalid; otherwise rail ID + 1 (so id ∈ [0,8] → a ∈ [1,9])
+const laneDataArray = new Float32Array(WORLD.maxSlots * WORLD.bufferSegs * 4);
+const laneDataTex   = new THREE.DataTexture(
+  laneDataArray, WORLD.maxSlots, WORLD.bufferSegs,
+  THREE.RGBAFormat, THREE.FloatType
+);
+laneDataTex.magFilter = THREE.NearestFilter;
+laneDataTex.minFilter = THREE.NearestFilter;
+laneDataTex.wrapS = THREE.ClampToEdgeWrapping;
+laneDataTex.wrapT = THREE.ClampToEdgeWrapping;
+laneDataTex.needsUpdate = true;
+
+function rebuildLaneData() {
+  const segW = CONFIG.segW;
+  const cameraSeg = Math.floor(WORLD.cameraX / segW);
+  const originSeg = cameraSeg - Math.floor(WORLD.bufferSegs / 2);
+  WORLD.laneOriginSeg = originSeg;
+
+  for (let r = 0; r < WORLD.bufferSegs; r++) {
+    const seg = originSeg + r;
+    const conns = SIM.connectionsAt(seg);
+    const sxWorld = seg * segW;
+    for (let c = 0; c < WORLD.maxSlots; c++) {
+      const i = (r * WORLD.maxSlots + c) * 4;
+      if (c < conns.length) {
+        const conn = conns[c];
+        const id = (typeof conn.id === 'number') ? conn.id : 0;
+        laneDataArray[i    ] = sxWorld;
+        laneDataArray[i + 1] = SIM.laneToY(conn.y1);
+        laneDataArray[i + 2] = SIM.laneToY(conn.y2);
+        laneDataArray[i + 3] = id + 1;
+      } else {
+        laneDataArray[i    ] = 0;
+        laneDataArray[i + 1] = 0;
+        laneDataArray[i + 2] = 0;
+        laneDataArray[i + 3] = 0;
+      }
+    }
+  }
+  laneDataTex.needsUpdate = true;
+}
+rebuildLaneData();
+
+// ── Rail shader ──────────────────────────────────────────────────────────
+const geo = new THREE.PlaneGeometry(2, 2);
+const mat = new THREE.ShaderMaterial({
+  uniforms: {
+    uResolution:  { value: new THREE.Vector2(1, 1) },
+    uTime:        { value: 0 },
+    uZoom:        { value: CONFIG.viewZoom },
+    uRailWidth:   { value: CONFIG.railWidth },
+    uRailSoft:    { value: CONFIG.railSoft },
+    uRailSigma:   { value: CONFIG.railSigma },
+    uRailOpacity: { value: CONFIG.railOpacity },
+    uBgColor:     { value: new THREE.Color(CONFIG.bgColor) },
+    uBlendMode:   { value: 0 },
+    uLaneColors:  { value: CONFIG.laneColors.map(h => new THREE.Color(h)) },
+
+    // Ticks (zoetrope)
+    uTickAmount:  { value: CONFIG.tickAmount },
+    uTickSpacing: { value: CONFIG.tickSpacing },
+    uTickWidth:   { value: CONFIG.tickWidth },
+
+    // Ink traps
+    uInkTrapAmount:    { value: CONFIG.inkTrapAmount },
+    uInkTrapSpacing:   { value: CONFIG.inkTrapSpacing },
+    uInkTrapDensity:   { value: CONFIG.inkTrapDensity },
+    uInkTrapWidth:     { value: CONFIG.inkTrapWidth },
+    uInkTrapDirection: { value: CONFIG.inkTrapDirection },
+
+    // Topology
+    uLaneData:    { value: laneDataTex },
+    uCameraX:     { value: 0 },
+    uSegW:        { value: CONFIG.segW },
+    uBufferSegs:  { value: WORLD.bufferSegs },
+    uMaxSlots:    { value: WORLD.maxSlots },
+    uLaneOriginX: { value: 0 },
+    uLaneSpacePerUnit: { value: CONFIG.laneSpace },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUV;
+    void main() {
+      vUV = uv;
+      gl_Position = vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUV;
+
+    uniform vec2  uResolution;
+    uniform float uTime;
+    uniform float uZoom;
+    uniform float uRailWidth;
+    uniform float uRailSoft;
+    uniform float uRailSigma;
+    uniform float uRailOpacity;
+    uniform vec3  uBgColor;
+    uniform int   uBlendMode;
+
+    // Hard cap on lane buckets — must match MAX_LANE_BUCKETS in app-three.js.
+    // Each bucket aggregates one rail's coverage.
+    #define MAX_LANE_BUCKETS 9
+    uniform vec3 uLaneColors[MAX_LANE_BUCKETS];
+
+    uniform float uTickAmount;
+    uniform float uTickSpacing;
+    uniform float uTickWidth;
+
+    uniform float uInkTrapAmount;
+    uniform float uInkTrapSpacing;
+    uniform float uInkTrapDensity;
+    uniform float uInkTrapWidth;
+    uniform float uInkTrapDirection;
+
+    uniform sampler2D uLaneData;
+    uniform float     uCameraX;
+    uniform float     uSegW;
+    uniform float     uBufferSegs;
+    uniform float     uMaxSlots;
+    uniform float     uLaneOriginX;
+    uniform float     uLaneSpacePerUnit;
+
+    // Fetch one connection record from the lane_data buffer.
+    //   .r = segment start X (world)
+    //   .g = start lane Y    (world)
+    //   .b = end   lane Y    (world)
+    //   .a = valid flag
+    vec4 fetchLane(float slot, float seg) {
+      float u = (slot + 0.5) / uMaxSlots;
+      float v = (seg  + 0.5) / uBufferSegs;
+      return texture2D(uLaneData, vec2(u, v));
+    }
+
+    // Smootherstep ribbon — flat tangents at both endpoints so branches
+    // hold parallel to the axis before peeling off. Returns top/bot edges
+    // around the lane centerline at parameter t along this connection.
+    vec2 ribbonEdges(float y1, float y2, float t, float halfW) {
+      float tc = clamp(t, 0.0, 1.0);
+      float s  = tc * tc * tc * (tc * (tc * 6.0 - 15.0) + 10.0);
+      float yc = mix(y1, y2, s);
+      return vec2(yc - halfW, yc + halfW);
+    }
+
+    // Ink traps — soft Gaussian "hills" that spawn along the rail at
+    // semi-random world-X positions, unique per rail (yLane). Each cell
+    // of width uInkTrapSpacing has at most one trap. Returns vec2(up, down)
+    // so the rail can swell on either side; uInkTrapDirection biases which.
+    vec2 inkTrap(float wx, float yLane) {
+      if (uInkTrapAmount < 1e-3 || uInkTrapDensity < 1e-3) return vec2(0.0);
+      float spacing = max(uInkTrapSpacing, 1.0);
+      float u       = wx / spacing;
+      float cellIdx = floor(u);
+      float laneU   = yLane / max(uLaneSpacePerUnit, 1.0);
+      float w_      = max(uInkTrapWidth, 1.0);
+      vec2  total   = vec2(0.0);
+      // Sum ±1 neighbour cells so the function is continuous across cells.
+      for (int k = -1; k <= 1; k++) {
+        float ci   = cellIdx + float(k);
+        float h1   = fract(sin(ci * 12.9898 + laneU * 78.233) * 43758.5453);
+        float gate = 1.0 - smoothstep(uInkTrapDensity - 0.04, uInkTrapDensity, h1);
+        if (gate < 0.001) continue;
+        float h2 = fract(sin(ci * 39.346 + laneU * 11.135 + 4.7) * 22578.1459);
+        float h3 = 0.55 + 0.45 * fract(sin(ci * 53.218 + laneU * 7.31 + 2.1) * 91237.13);
+        float h4 = fract(sin(ci * 67.123 + laneU * 13.7  + 9.3) * 53219.7);
+        float center   = (ci + mix(0.25, 0.75, h2)) * spacing;
+        float dist     = wx - center;
+        float strength = uInkTrapAmount * h3 * gate
+                       * exp(-(dist * dist) / (w_ * w_ * 0.5));
+        if (h4 < uInkTrapDirection) total.y += strength;
+        else                        total.x += strength;
+      }
+      return total;
+    }
+
+    // Periodic-gap mask along world-X. Returns 1 (rail visible) outside the
+    // tick zone, falling to (1 - uTickAmount) at each tick centre. Antialiased
+    // against the screen-space dx so edges stay crisp at any zoom.
+    float tickGap(float wx) {
+      if (uTickAmount < 1e-3) return 1.0;
+      float sp     = max(uTickSpacing, 1.0);
+      float u      = wx / sp;
+      float frac   = u - floor(u);
+      float dist   = min(frac, 1.0 - frac) * sp;
+      float halfW  = max(uTickWidth, 0.0) * 0.5;
+      float aa     = max(fwidth(wx), 1e-4);
+      float inside = 1.0 - smoothstep(halfW - aa, halfW + aa, dist);
+      return 1.0 - inside * uTickAmount;
+    }
+
+    // Per-lane color, sourced from the user-controlled uLaneColors array.
+    // Constant-index unroll keeps WebGL1 happy on drivers that reject
+    // dynamic indexing into uniform arrays.
+    vec3 laneColor(int idx) {
+      vec3 c = uLaneColors[0];
+      for (int k = 1; k < MAX_LANE_BUCKETS; k++) {
+        if (k == idx) c = uLaneColors[k];
+      }
+      return c;
+    }
+
+    // Figma-style blend ops. b = backdrop (running dst), s = source (lane
+    // color). Result is RGB blend; the per-lane alpha then mixes it in.
+    vec3 blendOp(vec3 b, vec3 s, int mode) {
+      if (mode == 1) return b * s;                                            // Multiply
+      if (mode == 2) return 1.0 - (1.0 - b) * (1.0 - s);                      // Screen
+      if (mode == 3) return min(b, s);                                        // Darken
+      if (mode == 4) return max(b, s);                                        // Lighten
+      if (mode == 5) return mix(2.0 * b * s,                                  // Overlay
+                                1.0 - 2.0 * (1.0 - b) * (1.0 - s),
+                                step(vec3(0.5), b));
+      if (mode == 6) return abs(b - s);                                       // Difference
+      if (mode == 7) return min(vec3(1.0), b + s);                            // Plus lighter
+      return s;                                                                // Normal
+    }
+
+    // Render the rail body at this fragment. Two-stage:
+    //   1. scan every connection, accumulate a max-coverage value into the
+    //      owner lane's bucket (so multiple conns of the same rail collapse
+    //      into one layer)
+    //   2. composite each lane's color onto the destination using the
+    //      chosen blend mode — this is where the layering effect happens
+    vec4 drawRailTopology(float wx, float wy) {
+      float halfW = uRailWidth;
+      float sig   = max(uRailSigma, 0.05);
+      float softK = clamp(uRailSoft, 0.0, 1.0);
+      float aa    = max(fwidth(wy), 1e-4);
+
+      float laneCov[MAX_LANE_BUCKETS];
+      for (int i = 0; i < MAX_LANE_BUCKETS; i++) laneCov[i] = 0.0;
+
+      // Single per-fragment computation — applies uniformly to every rail
+      // at this wx so all rails freeze together at the zoetrope speed.
+      float gap = tickGap(wx);
+
+      for (int r = 0; r < 33; r++) {
+        if (float(r) >= uBufferSegs) break;
+        for (int s = 0; s < 9; s++) {
+          if (float(s) >= uMaxSlots) break;
+          vec4 conn = fetchLane(float(s), float(r));
+          if (conn.a < 0.5) break;
+          // Rail ID is encoded as alpha-1 (so a=0 means invalid, a∈[1,9]
+          // are rail IDs 0..8). Round-then-subtract guards against any
+          // float roundoff in the texture sample.
+          int rid = int(conn.a + 0.5) - 1;
+          if (rid < 0 || rid >= MAX_LANE_BUCKETS) continue;
+          float sx = conn.r;
+          float y1 = conn.g;
+          float y2 = conn.b;
+          float t  = (wx - sx) / uSegW;
+          if (t < 0.0 || t >= 1.0) continue;
+
+          vec2  edges  = ribbonEdges(y1, y2, t, halfW);
+          float yMid   = (edges.x + edges.y) * 0.5;
+          float hHalf  = (edges.y - edges.x) * 0.5;
+          float yIdent = (y1 + y2) * 0.5;
+          vec2  trap   = inkTrap(wx, yIdent);
+          float yMidT  = yMid + (trap.y - trap.x) * 0.5;
+          float hHalfT = hHalf + (trap.x + trap.y) * 0.5;
+          float dY     = wy - yMidT;
+
+          // Strip SDF — distance to rail y-edges only. X is gated by the
+          // t-range check above; without x-edges, collinear conns butt up
+          // flush at segment boundaries.
+          float d = abs(dY) - hHalfT;
+
+          float fillCov = 1.0 - smoothstep(-aa, aa, d);
+          float dHalo   = max(d, 0.0) / max(hHalfT, 1e-4);
+          float bodyC   = exp(-(dHalo * dHalo) / (2.0 * sig * sig)) * softK;
+          float alpha   = max(fillCov, bodyC) * clamp(uRailOpacity, 0.0, 1.0) * gap;
+          if (alpha < 1e-4) continue;
+
+          // Constant-index write — WebGL1 needs static indexing into local
+          // float arrays on some drivers.
+          for (int k = 0; k < MAX_LANE_BUCKETS; k++) {
+            if (k == rid && alpha > laneCov[k]) laneCov[k] = alpha;
+          }
+        }
+      }
+
+      vec3 dst = uBgColor;
+      float maxA = 0.0;
+      for (int i = 0; i < MAX_LANE_BUCKETS; i++) {
+        float a = laneCov[i];
+        if (a < 1e-4) continue;
+        vec3 src     = laneColor(i);
+        vec3 blended = blendOp(dst, src, uBlendMode);
+        dst = mix(dst, blended, a);
+        if (a > maxA) maxA = a;
+      }
+      return vec4(dst, maxA);
+    }
+
+    void main() {
+      // Screen → world. viewH = world units that fit vertically; uZoom
+      // scales it (smaller zoom = see more).
+      float aspect = uResolution.x / uResolution.y;
+      float viewH  = 1000.0 / uZoom;
+      float viewW  = viewH * aspect;
+      float wx = uCameraX + (vUV.x - 0.5) * viewW;
+      float wy = (vUV.y - 0.5) * viewH;
+
+      // drawRailTopology already starts dst at uBgColor, so no extra bg
+      // composite needed in main().
+      vec4 rail = drawRailTopology(wx, wy);
+      gl_FragColor = vec4(rail.rgb, 1.0);
+    }
+  `,
+});
+
+const quad = new THREE.Mesh(geo, mat);
+scene.add(quad);
+
+function updateResolution() {
+  const size = new THREE.Vector2();
+  renderer.getSize(size);
+  mat.uniforms.uResolution.value.set(size.x, size.y);
+}
+window.addEventListener('resize', updateResolution);
+updateResolution();
+
+// ── Animation loop ───────────────────────────────────────────────────────
+const clock = new THREE.Clock();
+let exporting = false;   // when true, the export loop drives sim/render manually
+
+function tick() {
+  if (exporting) {
+    // Discard accumulated dt so the first frame after export resumes cleanly.
+    clock.getDelta();
+    requestAnimationFrame(tick);
+    return;
+  }
+
+  const dt = clock.getDelta();
+  mat.uniforms.uTime.value += dt;
+
+  WORLD.cameraX += CONFIG.speed * dt;
+  const worldLoop = SIM.WORLD_LOOP;
+  if (Number.isFinite(worldLoop) && WORLD.cameraX >= worldLoop) WORLD.cameraX -= worldLoop;
+  rebuildLaneData();
+  mat.uniforms.uCameraX.value     = WORLD.cameraX;
+  mat.uniforms.uLaneOriginX.value = WORLD.laneOriginSeg * CONFIG.segW;
+
+  renderer.render(scene, camera);
+  // Throttled minimap playhead update (~10 Hz).
+  if ((tick._acc = (tick._acc || 0) + dt) >= 0.1) {
+    tick._acc = 0;
+    updateMinimapPlayhead();
+  }
+  requestAnimationFrame(tick);
+}
+tick();
+
+// ── PNG sequence export ──────────────────────────────────────────────────
+// Walks the sim forward N frames at the configured fps (using current
+// CONFIG.speed for camera travel), captures each rendered canvas as a PNG,
+// and writes them out. Prefers the File System Access API for direct folder
+// writes; falls back to a single .zip download via JSZip otherwise.
+async function exportPngSequence() {
+  const btn = document.getElementById('export-btn');
+  if (!btn || exporting) return;
+
+  const N   = Math.max(1, CONFIG.exportFrames | 0);
+  const fps = Math.max(1, CONFIG.exportFps | 0);
+  const dt  = 1 / fps;
+
+  let dirHandle = null;
+  if (window.showDirectoryPicker) {
+    try {
+      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    } catch (e) {
+      if (e.name === 'AbortError') return;   // user cancelled
+      console.warn('Directory picker unavailable, falling back to ZIP', e);
+    }
+  }
+  const zip = (!dirHandle && typeof JSZip !== 'undefined') ? new JSZip() : null;
+  if (!dirHandle && !zip) {
+    alert('PNG export needs either the File System Access API (Chrome/Edge)\n'
+        + 'or JSZip. Neither is available in this browser.');
+    return;
+  }
+
+  exporting = true;
+  btn.disabled = true;
+  const origLabel = btn.textContent;
+
+  try {
+    for (let i = 0; i < N; i++) {
+      btn.textContent = `Exporting ${i + 1}/${N}…`;
+
+      // Advance one frame's worth of sim, then render.
+      mat.uniforms.uTime.value += dt;
+      WORLD.cameraX += CONFIG.speed * dt;
+      rebuildLaneData();
+      mat.uniforms.uCameraX.value     = WORLD.cameraX;
+      mat.uniforms.uLaneOriginX.value = WORLD.laneOriginSeg * CONFIG.segW;
+      renderer.render(scene, camera);
+
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+      const filename = `frame_${String(i).padStart(5, '0')}.png`;
+
+      if (dirHandle) {
+        const fh = await dirHandle.getFileHandle(filename, { create: true });
+        const w  = await fh.createWritable();
+        await w.write(blob);
+        await w.close();
+      } else {
+        zip.file(filename, blob);
+      }
+      // Yield to the browser so the button label and any UI redraws happen.
+      await new Promise(r => setTimeout(r, 0));
+    }
+
+    if (zip) {
+      btn.textContent = 'Building ZIP…';
+      const zipBlob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `railway-${Date.now()}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  } finally {
+    btn.textContent = origLabel;
+    btn.disabled = false;
+    exporting = false;
+  }
+}
+
+// ── Panel wiring ─────────────────────────────────────────────────────────
+const BLEND_MODES = ['normal', 'multiply', 'screen', 'darken', 'lighten',
+                     'overlay', 'difference', 'plus-lighter'];
+function blendModeIdx(name) {
+  const i = BLEND_MODES.indexOf(name);
+  return i < 0 ? 0 : i;
+}
+
+function applyConfig() {
+  mat.uniforms.uZoom.value        = CONFIG.viewZoom;
+  mat.uniforms.uRailWidth.value   = CONFIG.railWidth;
+  mat.uniforms.uRailSoft.value    = CONFIG.railSoft;
+  mat.uniforms.uRailSigma.value   = CONFIG.railSigma;
+  mat.uniforms.uRailOpacity.value = CONFIG.railOpacity;
+  mat.uniforms.uBgColor.value.set(CONFIG.bgColor);
+  mat.uniforms.uBlendMode.value   = blendModeIdx(CONFIG.blendMode);
+  for (let i = 0; i < MAX_LANE_BUCKETS; i++) {
+    const hex = CONFIG.laneColors[i] || '#000000';
+    mat.uniforms.uLaneColors.value[i].set(hex);
+  }
+  mat.uniforms.uSegW.value             = CONFIG.segW;
+  mat.uniforms.uLaneSpacePerUnit.value = CONFIG.laneSpace;
+
+  mat.uniforms.uTickAmount.value  = CONFIG.tickAmount;
+  mat.uniforms.uTickSpacing.value = CONFIG.tickSpacing;
+  mat.uniforms.uTickWidth.value   = CONFIG.tickWidth;
+
+  mat.uniforms.uInkTrapAmount.value    = CONFIG.inkTrapAmount;
+  mat.uniforms.uInkTrapSpacing.value   = CONFIG.inkTrapSpacing;
+  mat.uniforms.uInkTrapDensity.value   = CONFIG.inkTrapDensity;
+  mat.uniforms.uInkTrapWidth.value     = CONFIG.inkTrapWidth;
+  mat.uniforms.uInkTrapDirection.value = CONFIG.inkTrapDirection;
+
+  SIM.setScript(CONFIG.simScript);
+  SIM.setLoopSegs(CONFIG.loopSegs);
+  SIM.setSegW(CONFIG.segW);
+  SIM.setLaneSpace(CONFIG.laneSpace);
+  SIM.setSeed(CONFIG.seed);
+  SIM.setMergeChance(CONFIG.mergeChance);
+  SIM.setSplitChance(CONFIG.splitChance);
+  SIM.setMaxTracks(CONFIG.maxTracks);
+  SIM.setMode(CONFIG.simMode);
+  rebuildLaneData();
+
+  renderer.setClearColor(new THREE.Color(CONFIG.bgColor));
+
+  // Mode-conditional panel sections — hide knobs that don't apply.
+  const scriptedOnly   = document.getElementById('scripted-only');
+  const proceduralOnly = document.getElementById('procedural-only');
+  if (scriptedOnly)   scriptedOnly.style.display   = CONFIG.simMode === 'scripted'   ? '' : 'none';
+  if (proceduralOnly) proceduralOnly.style.display = CONFIG.simMode === 'procedural' ? '' : 'none';
+
+  buildMinimap();
+}
+
+// ── Minimap ──────────────────────────────────────────────────────────────
+// SVG diagram of the rail topology. Scripted mode: full loop. Procedural
+// mode: rolling window around current cameraX. Click to seek the camera.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const MM = { W: 600, H: 110, PAD_X: 6, PAD_Y: 8 };
+const MM_WINDOW_BEHIND = 6;
+const MM_WINDOW_AHEAD  = 24;
+let minimapPlayhead = null;
+let minimapInfo = null;       // { segStart, segCount, segPerUnit, isProcedural }
+
+function mmSegX(segOffset, segCount) {
+  const span = MM.W - 2 * MM.PAD_X;
+  return MM.PAD_X + (segOffset / segCount) * span;
+}
+function mmLaneY(l, laneCount) {
+  // Match the shader: lane 0 at the bottom.
+  const span = Math.max(1, laneCount - 1);
+  return MM.H - MM.PAD_Y - (l / span) * (MM.H - 2 * MM.PAD_Y);
+}
+function mmCubicPath(x1, y1, x2, y2) {
+  const cpx = x1 + (x2 - x1) * 0.5;
+  return `M ${x1.toFixed(1)} ${y1.toFixed(1)} `
+       + `C ${cpx.toFixed(1)} ${y1.toFixed(1)}, ${cpx.toFixed(1)} ${y2.toFixed(1)}, ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+}
+
+function buildMinimap() {
+  const svg = document.getElementById('minimap');
+  if (!svg) return;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  const isProcedural = CONFIG.simMode === 'procedural';
+  const laneCount = SIM.LANE_COUNT;
+  let segStart, segCount;
+  if (isProcedural) {
+    const cameraSeg = Math.floor(WORLD.cameraX / CONFIG.segW);
+    segStart = cameraSeg - MM_WINDOW_BEHIND;
+    segCount = MM_WINDOW_BEHIND + MM_WINDOW_AHEAD;
+  } else {
+    segStart = 0;
+    segCount = SIM.LOOP_SEGS;
+  }
+  minimapInfo = { segStart, segCount, isProcedural };
+
+  // Faint lane guides.
+  for (let l = 0; l < laneCount; l++) {
+    const y = mmLaneY(l, laneCount);
+    const line = document.createElementNS(SVG_NS, 'line');
+    line.setAttribute('x1', MM.PAD_X);
+    line.setAttribute('x2', MM.W - MM.PAD_X);
+    line.setAttribute('y1', y);
+    line.setAttribute('y2', y);
+    line.setAttribute('stroke', 'rgba(255,255,255,0.05)');
+    line.setAttribute('stroke-width', '1');
+    svg.appendChild(line);
+  }
+
+  // Connections.
+  for (let i = 0; i < segCount; i++) {
+    const seg = segStart + i;
+    const conns = SIM.connectionsAt(seg);
+    const x1 = mmSegX(i,     segCount);
+    const x2 = mmSegX(i + 1, segCount);
+    for (const c of conns) {
+      const yA = mmLaneY(c.y1, laneCount);
+      const yB = mmLaneY(c.y2, laneCount);
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', mmCubicPath(x1, yA, x2, yB));
+      path.setAttribute('stroke', 'rgba(200,210,220,0.7)');
+      path.setAttribute('stroke-width', '1.5');
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke-linecap', 'round');
+      svg.appendChild(path);
+    }
+  }
+
+  // Playhead — created once, repositioned each frame.
+  minimapPlayhead = document.createElementNS(SVG_NS, 'line');
+  minimapPlayhead.setAttribute('y1', 0);
+  minimapPlayhead.setAttribute('y2', MM.H);
+  minimapPlayhead.setAttribute('stroke', '#6aa3c4');
+  minimapPlayhead.setAttribute('stroke-width', '1.5');
+  svg.appendChild(minimapPlayhead);
+
+  // Click-to-seek.
+  svg.onclick = (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const xRel = (ev.clientX - rect.left) / rect.width * MM.W;
+    const segOffset = ((xRel - MM.PAD_X) / (MM.W - 2 * MM.PAD_X)) * segCount;
+    const segAbs = segStart + segOffset;
+    const newCam = segAbs * CONFIG.segW;
+    const wl = SIM.WORLD_LOOP;
+    WORLD.cameraX = Number.isFinite(wl) ? ((newCam % wl) + wl) % wl : Math.max(0, newCam);
+  };
+
+  updateMinimapPlayhead();
+}
+
+function updateMinimapPlayhead() {
+  if (!minimapPlayhead || !minimapInfo) return;
+  const { segStart, segCount } = minimapInfo;
+  const cameraSegFloat = WORLD.cameraX / CONFIG.segW;
+  const offset = cameraSegFloat - segStart;
+  // In procedural mode the window slides with the camera; rebuild every so
+  // often so the playhead doesn't drift off the edge.
+  if (minimapInfo.isProcedural &&
+      (offset < 0 || offset > segCount)) {
+    buildMinimap();
+    return;
+  }
+  const x = mmSegX(offset, segCount);
+  minimapPlayhead.setAttribute('x1', x);
+  minimapPlayhead.setAttribute('x2', x);
+}
+
+// Auto-wire any [data-k] input/select in the panel to its CONFIG key.
+function bindGlobalControls() {
+  document.querySelectorAll('#panel input[data-k], #panel select[data-k]').forEach((el) => {
+    const key = el.dataset.k;
+    if (!(key in CONFIG)) return;
+    const isNum   = el.type === 'range' || el.type === 'number';
+    const isColor = el.type === 'color';
+    el.value = CONFIG[key];
+
+    let readout = document.querySelector(`#panel [data-v="${key}"]`);
+    let numInput = null;
+    if (el.type === 'range' && readout && readout.tagName === 'SPAN') {
+      numInput = document.createElement('input');
+      numInput.type = 'number';
+      numInput.className = 'num-readout';
+      if (el.min  !== '') numInput.min  = el.min;
+      if (el.max  !== '') numInput.max  = el.max;
+      if (el.step !== '') numInput.step = el.step;
+      numInput.value = +CONFIG[key];
+      numInput.dataset.v = key;
+      readout.replaceWith(numInput);
+      readout = numInput;
+      numInput.addEventListener('input', () => {
+        const v = parseFloat(numInput.value);
+        if (Number.isNaN(v)) return;
+        CONFIG[key] = v;
+        el.value = v;
+        applyConfig();
+      });
+    }
+    const setReadout = (v) => {
+      if (!readout) return;
+      if (numInput) numInput.value = v;
+      else readout.textContent = isNum ? (+v).toFixed(2) : String(v);
+    };
+    setReadout(CONFIG[key]);
+    el.addEventListener('input', () => {
+      const v = isNum   ? parseFloat(el.value)
+              : isColor ? el.value
+              : el.value;
+      CONFIG[key] = v;
+      setReadout(v);
+      applyConfig();
+    });
+  });
+
+  // Palette controls — dropdown of curated palettes, three HSL knobs that
+  // re-derive all lane colours from a spread, and a randomize button that
+  // jitters the HSL knobs into a fresh palette.
+  function regenerateLaneColors() {
+    const c = new THREE.Color();
+    const n = MAX_LANE_BUCKETS;
+    for (let i = 0; i < n; i++) {
+      const h = ((i / n) + CONFIG.paletteHueOffset) % 1;
+      c.setHSL((h + 1) % 1, CONFIG.paletteSat, CONFIG.paletteLight);
+      CONFIG.laneColors[i] = '#' + c.getHexString();
+    }
+  }
+
+  const paletteSelect = document.getElementById('palette-select');
+  if (paletteSelect) {
+    paletteSelect.addEventListener('change', () => {
+      const name = paletteSelect.value;
+      if (name === 'default') {
+        CONFIG.paletteHueOffset = DEFAULT_CONFIG.paletteHueOffset;
+        CONFIG.paletteSat       = DEFAULT_CONFIG.paletteSat;
+        CONFIG.paletteLight     = DEFAULT_CONFIG.paletteLight;
+        regenerateLaneColors();
+      } else if (Array.isArray(PALETTES[name])) {
+        for (let i = 0; i < MAX_LANE_BUCKETS; i++) {
+          CONFIG.laneColors[i] = PALETTES[name][i] || '#000000';
+        }
+      }
+      applyConfig();
+      syncPanelToConfig();
+    });
+  }
+
+  // HSL knobs piggy-back on the generic data-k binding (which already syncs
+  // CONFIG and the readout). We add a second listener that, *after* the
+  // generic one runs, regenerates lane colours from the new HSL params and
+  // re-pushes them. The dropdown drifts to "(custom)" — we don't track that.
+  ['paletteHueOffset', 'paletteSat', 'paletteLight'].forEach((k) => {
+    const inp = document.querySelector(`#panel input[data-k="${k}"]`);
+    if (!inp) return;
+    inp.addEventListener('input', () => {
+      regenerateLaneColors();
+      applyConfig();
+      // Update only the swatches — leave the slider/readout for this knob
+      // alone (the generic binding already set them) to avoid value flicker
+      // mid-drag.
+      document.querySelectorAll('#lane-color-row input[data-lane]').forEach((el) => {
+        const i = parseInt(el.dataset.lane, 10);
+        const c = CONFIG.laneColors && CONFIG.laneColors[i];
+        if (c) el.value = c;
+      });
+    });
+  });
+
+  const rndBtn = document.getElementById('palette-randomize');
+  if (rndBtn) {
+    rndBtn.addEventListener('click', () => {
+      CONFIG.paletteHueOffset = Math.random();
+      CONFIG.paletteSat       = 0.4 + Math.random() * 0.4;
+      CONFIG.paletteLight     = 0.4 + Math.random() * 0.2;
+      regenerateLaneColors();
+      applyConfig();
+      syncPanelToConfig();
+    });
+  }
+
+  // Rail color pickers — one per possible rail ID (0..MAX_LANE_BUCKETS-1).
+  const laneRow = document.getElementById('lane-color-row');
+  if (laneRow) {
+    laneRow.innerHTML = '';
+    for (let i = 0; i < MAX_LANE_BUCKETS; i++) {
+      const inp = document.createElement('input');
+      inp.type = 'color';
+      inp.dataset.lane = String(i);
+      inp.value = CONFIG.laneColors[i];
+      inp.title = `Rail ${i}`;
+      inp.addEventListener('input', () => {
+        CONFIG.laneColors[i] = inp.value;
+        applyConfig();
+      });
+      laneRow.appendChild(inp);
+    }
+  }
+
+  // Zoetrope freeze readout + snap button. Freeze speed = tickSpacing ×
+  // refresh rate; zoom drops out because period and motion both scale with
+  // it. We assume 60 Hz — common case; the button just sets CONFIG.speed.
+  const FREEZE_HZ = 60;
+  function updateFreezeHint() {
+    const el = document.getElementById('freeze-hint');
+    if (!el) return;
+    const f = (CONFIG.tickSpacing | 0) * FREEZE_HZ;
+    el.textContent = `freeze ≈ ${f.toLocaleString()} wu/s @ ${FREEZE_HZ} Hz`;
+  }
+  const snapBtn = document.getElementById('snap-freeze');
+  if (snapBtn) {
+    snapBtn.addEventListener('click', () => {
+      CONFIG.speed = (CONFIG.tickSpacing | 0) * FREEZE_HZ;
+      applyConfig();
+      syncPanelToConfig();
+    });
+  }
+  const tickSpacingEl = document.querySelector('#panel input[data-k="tickSpacing"]');
+  if (tickSpacingEl) tickSpacingEl.addEventListener('input', updateFreezeHint);
+  updateFreezeHint();
+
+  // Preset save / revert + drag-and-drop load.
+  const saveBtn   = document.getElementById('preset-save');
+  const revertBtn = document.getElementById('preset-revert');
+  if (saveBtn) {
+    saveBtn.addEventListener('click', () => {
+      const json = JSON.stringify(CONFIG, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `railway-preset-${Date.now()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+  }
+  if (revertBtn) {
+    revertBtn.addEventListener('click', () => {
+      Object.assign(CONFIG, JSON.parse(JSON.stringify(DEFAULT_CONFIG)));
+      applyConfig();
+      syncPanelToConfig();
+    });
+  }
+
+  // Drop a .json preset anywhere on the page to load it. Show a full-window
+  // overlay while a file is being dragged so the target is obvious.
+  let dragDepth = 0;
+  window.addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.items || []).some(it => it.kind === 'file')) return;
+    dragDepth++;
+    document.body.classList.add('dragging-preset');
+  });
+  window.addEventListener('dragleave', () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) document.body.classList.remove('dragging-preset');
+  });
+  window.addEventListener('dragover', (e) => { e.preventDefault(); });
+  window.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove('dragging-preset');
+    const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const incoming = JSON.parse(text);
+      if (typeof incoming !== 'object' || incoming === null) throw new Error('Preset JSON must be an object.');
+      // Only copy keys that actually exist in the current schema — silently
+      // ignores unknown fields so older / newer presets degrade gracefully.
+      for (const key of Object.keys(CONFIG)) {
+        if (key in incoming) CONFIG[key] = incoming[key];
+      }
+      applyConfig();
+      syncPanelToConfig();
+    } catch (err) {
+      console.error('Failed to load preset:', err);
+      alert('Could not load preset: ' + err.message);
+    }
+  });
+
+  // Export button.
+  const exportBtn = document.getElementById('export-btn');
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      exportPngSequence().catch(err => {
+        console.error('Export failed', err);
+        exportBtn.textContent = 'Export PNG sequence';
+        exportBtn.disabled = false;
+        exporting = false;
+      });
+    });
+  }
+
+  // Re-roll button — bumps the procedural seed.
+  const reroll = document.getElementById('reroll-btn');
+  if (reroll) {
+    reroll.addEventListener('click', () => {
+      CONFIG.seed = Math.floor(Math.random() * 99999) + 1;
+      const seedEl = document.querySelector('#panel input[data-k="seed"]');
+      if (seedEl) seedEl.value = CONFIG.seed;
+      applyConfig();
+    });
+  }
+
+  // Collapse button.
+  const toggle = document.getElementById('panel-toggle');
+  const panel  = document.getElementById('panel');
+  if (toggle && panel) {
+    toggle.addEventListener('click', () => {
+      panel.classList.toggle('collapsed');
+      toggle.textContent = panel.classList.contains('collapsed') ? '+' : '–';
+    });
+  }
+}
+
+// Push the current CONFIG values back into every panel control. Used after
+// preset import or revert — touches the data-k inputs/selects, the [data-v]
+// readouts (which the range-binding rewrites into editable number inputs),
+// and the lane-color pickers (whose values come from CONFIG.laneColors[i]).
+function syncPanelToConfig() {
+  document.querySelectorAll('#panel input[data-k], #panel select[data-k]').forEach((el) => {
+    const key = el.dataset.k;
+    if (!(key in CONFIG)) return;
+    el.value = CONFIG[key];
+  });
+  document.querySelectorAll('#panel [data-v]').forEach((el) => {
+    const key = el.dataset.v;
+    if (!(key in CONFIG)) return;
+    if (el.tagName === 'INPUT') el.value = CONFIG[key];
+    else el.textContent = (typeof CONFIG[key] === 'number')
+      ? Number(CONFIG[key]).toFixed(2) : String(CONFIG[key]);
+  });
+  document.querySelectorAll('#lane-color-row input[data-lane]').forEach((el) => {
+    const i = parseInt(el.dataset.lane, 10);
+    const c = CONFIG.laneColors && CONFIG.laneColors[i];
+    if (c) el.value = c;
+  });
+}
+
+bindGlobalControls();
+applyConfig();
+
+window.RAILWAY = { CONFIG, mat, applyConfig, renderer, scene, camera, WORLD, rebuildLaneData };
+console.log('Railway minimal — sim + rails. Tweak via RAILWAY.CONFIG.');

@@ -1,0 +1,354 @@
+// Lane simulator — persistent-rail port. Each rail has a stable id (0..8)
+// and a current lane index. SPLIT spawns new rails (capped at MAX_RAILS);
+// MERGE relocates a rail to a target lane (overlapping any rail already
+// there) — rails do not die. The renderer uses rail IDs to color each rail
+// independently, so overlapping rails composite via the chosen blend mode.
+//
+// Connection record: { id, y1, y2 } where y1=start lane, y2=end lane, id=
+// stable rail identifier. Each segment's rails each emit exactly one conn;
+// SPLITs additionally emit one extra conn per spawned rail.
+
+const SIM = (() => {
+
+  // Hard cap on simultaneous rails — must match MAX_LANE_BUCKETS in
+  // app-three.js / its GLSL #define. IDs are reused only when a rail is
+  // ever removed, but in this model rails persist forever, so once 9 rails
+  // exist, further SPLITs become no-ops.
+  const MAX_RAILS = 9;
+
+  // ── Scripts (match TD tables sim_script_v1, sim_script_v5) ───────────────
+  const SCRIPTS = {
+    v1: [
+      { seg: 0,  type: 'INIT',  from: 3 },
+      { seg: 5,  type: 'SPLIT', from: 3, to: 2 },
+      { seg: 5,  type: 'SPLIT', from: 3, to: 4 },
+      { seg: 13, type: 'MERGE', from: 2, to: 3 },
+      { seg: 13, type: 'MERGE', from: 4, to: 3 },
+      { seg: 20, type: 'SPLIT', from: 3, to: 2 },
+      { seg: 20, type: 'SPLIT', from: 3, to: 4 },
+      { seg: 28, type: 'MERGE', from: 2, to: 3 },
+      { seg: 28, type: 'MERGE', from: 4, to: 3 },
+    ],
+    v5: [
+      { seg: 0,  type: 'INIT',  from: 3 },
+      { seg: 5,  type: 'SPLIT', from: 3, to: 2 },
+      { seg: 5,  type: 'SPLIT', from: 3, to: 4 },
+      { seg: 10, type: 'SPLIT', from: 2, to: 1 },
+      { seg: 10, type: 'SPLIT', from: 4, to: 5 },
+      { seg: 18, type: 'MERGE', from: 1, to: 2 },
+      { seg: 18, type: 'MERGE', from: 5, to: 4 },
+      { seg: 23, type: 'MERGE', from: 2, to: 3 },
+      { seg: 23, type: 'MERGE', from: 4, to: 3 },
+    ],
+  };
+
+  let ACTIVE = SCRIPTS.v1;
+
+  let MODE = 'scripted';
+
+  let MERGE_CHANCE = 0.4;
+  let SPLIT_CHANCE = 0.9;
+  let MAX_TRACKS   = 7;
+  let SEED         = 1;
+
+  let LOOP_SEGS  = 30;
+  let SEG_W      = 400;
+  let CENTER_Y   = 0;
+  let LANE_SPACE = 180;
+  let LANE_COUNT = 7;
+  const CENTER_IDX = () => (LANE_COUNT - 1) / 2;
+
+  // ── Seeded RNG (mulberry32) ──────────────────────────────────────────────
+  let rngState = 1;
+  function rngReset(s) { rngState = ((s >>> 0) || 1); }
+  function rng() {
+    rngState = (rngState + 0x6D2B79F5) >>> 0;
+    let t = rngState;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+
+  const laneToY = (l) => CENTER_Y + (l - CENTER_IDX()) * LANE_SPACE;
+  const mod = (n, m) => ((n % m) + m) % m;
+  const smoothstep = (t) => {
+    const s = Math.max(0, Math.min(1, t));
+    return s * s * (3 - 2 * s);
+  };
+
+  // ── Rail helpers ─────────────────────────────────────────────────────────
+  function copyRails(rails) {
+    return rails.map(r => ({ id: r.id, lane: r.lane }));
+  }
+
+  function nextAvailableId(usedIds) {
+    for (let i = 0; i < MAX_RAILS; i++) {
+      if (!usedIds.has(i)) return i;
+    }
+    return -1;
+  }
+
+  // Initial rail set — from INIT event's `from` lanes (space/comma list),
+  // else default to lane 3 (or last lane if LANE_COUNT < 4).
+  function initialRails() {
+    const lanes = [];
+    const init = ACTIVE.find(e => String(e.type).toUpperCase() === 'INIT');
+    if (init) {
+      for (const tok of String(init.from).replace(/,/g, ' ').split(/\s+/)) {
+        const i = parseInt(tok, 10);
+        if (Number.isInteger(i) && i >= 0 && i < LANE_COUNT) lanes.push(i);
+      }
+    }
+    if (lanes.length === 0) lanes.push(Math.min(3, LANE_COUNT - 1));
+    return lanes.map((lane, idx) => ({ id: idx, lane }));
+  }
+
+  // Bucket events by loop-seg (INIT filtered).
+  function bucketEvents() {
+    const b = {};
+    for (const e of ACTIVE) {
+      if (String(e.type).toUpperCase() === 'INIT') continue;
+      const s = mod(e.seg, LOOP_SEGS);
+      (b[s] = b[s] || []).push(e);
+    }
+    return b;
+  }
+
+  // ── Step segment for scripted mode ───────────────────────────────────────
+  // Apply this segment's events to the rail list. Multiple SPLITs from the
+  // same source lane share one trunk-continuation conn and spawn N new rails
+  // (matches v1 / v5 which emit two SPLITs per Y-junction). MERGE relocates
+  // an existing rail to a target lane — rails persist.
+  function stepSegmentRails(rails, events) {
+    const conns = [];
+    const endRails = copyRails(rails);
+    const handled = new Set();          // rail IDs whose conn is already added
+
+    // Group SPLITs by source lane.
+    const splitsBySrc = new Map();
+    for (const ev of events) {
+      if (String(ev.type).toUpperCase() !== 'SPLIT') continue;
+      const la = parseInt(ev.from, 10);
+      if (!Number.isInteger(la)) continue;
+      if (!splitsBySrc.has(la)) splitsBySrc.set(la, []);
+      splitsBySrc.get(la).push(ev);
+    }
+
+    for (const [srcLane, evs] of splitsBySrc) {
+      const trunk = rails.find(r => r.lane === srcLane && !handled.has(r.id));
+      if (!trunk) continue;
+      conns.push({ id: trunk.id, y1: srcLane, y2: srcLane });
+      handled.add(trunk.id);
+
+      const usedIds = new Set([
+        ...rails.map(r => r.id),
+        ...endRails.map(r => r.id),
+      ]);
+      for (const ev of evs) {
+        const lb = ev.to !== undefined ? parseInt(ev.to, 10) : null;
+        if (lb === null || lb < 0 || lb >= LANE_COUNT) continue;
+        const newId = nextAvailableId(usedIds);
+        if (newId === -1) continue;     // rail-cap hit
+        usedIds.add(newId);
+        conns.push({ id: newId, y1: srcLane, y2: lb });
+        endRails.push({ id: newId, lane: lb });
+      }
+    }
+
+    // MERGEs: relocate a rail at `from` to `to`. The rail keeps its ID and
+    // ends up overlapping whatever rail was already at `to`.
+    for (const ev of events) {
+      if (String(ev.type).toUpperCase() !== 'MERGE') continue;
+      const la = parseInt(ev.from, 10);
+      const lb = ev.to !== undefined ? parseInt(ev.to, 10) : null;
+      if (lb === null || lb < 0 || lb >= LANE_COUNT) continue;
+      const rail = rails.find(r => r.lane === la && !handled.has(r.id));
+      if (!rail) continue;
+      conns.push({ id: rail.id, y1: la, y2: lb });
+      handled.add(rail.id);
+      const er = endRails.find(r => r.id === rail.id);
+      if (er) er.lane = lb;
+    }
+
+    // Pass-through — every rail without a custom conn goes straight.
+    for (const rail of rails) {
+      if (!handled.has(rail.id)) {
+        conns.push({ id: rail.id, y1: rail.lane, y2: rail.lane });
+      }
+    }
+
+    return { conns, endRails };
+  }
+
+  // ── Step segment for procedural mode ─────────────────────────────────────
+  // Metro-line model: each rail is an independent walker on the lane grid.
+  // Per segment, every rail rolls its own shift (±1 lane or stay), with no
+  // notion of merging or "outer rails first". Rails freely cross other
+  // rails' paths because shifts are decided independently — if rail A is
+  // at lane 2 and rolls "+1" while rail B is at lane 3 and rolls "−1",
+  // their paths visually swap through each other in that segment.
+  //
+  // MERGE_CHANCE  — repurposed as per-rail per-segment shift probability.
+  //                 Half of it goes to "shift up", half to "shift down".
+  // SPLIT_CHANCE  — repurposed as per-segment chance to spawn a new rail
+  //                 at a random lane (capped by MAX_TRACKS / MAX_RAILS).
+  function generateLogicProceduralRails(rails) {
+    const conns    = [];
+    const endRails = copyRails(rails);
+
+    // Per-rail independent shift. Lane bounds clamp to [0, LANE_COUNT-1];
+    // a roll that would push past the edge becomes a stay.
+    for (const rail of endRails) {
+      const r = rng();
+      let nextLane = rail.lane;
+      if (r < MERGE_CHANCE * 0.5) {
+        if (rail.lane > 0) nextLane = rail.lane - 1;
+      } else if (r < MERGE_CHANCE) {
+        if (rail.lane < LANE_COUNT - 1) nextLane = rail.lane + 1;
+      }
+      conns.push({ id: rail.id, y1: rail.lane, y2: nextLane });
+      rail.lane = nextLane;
+    }
+
+    // Per-segment spawn roll — adds a new line at a random lane.
+    if (rng() < SPLIT_CHANCE
+        && rails.length < MAX_TRACKS
+        && rails.length < MAX_RAILS) {
+      const usedIds = new Set(endRails.map(r => r.id));
+      const newId = nextAvailableId(usedIds);
+      if (newId !== -1) {
+        const startLane = Math.floor(rng() * LANE_COUNT);
+        conns.push({ id: newId, y1: startLane, y2: startLane });
+        endRails.push({ id: newId, lane: startLane });
+      }
+    }
+
+    return { conns, endRails };
+  }
+
+  // ── Unified rolling cache ────────────────────────────────────────────────
+  // Both modes use a single forward-growing cache. STATE.rails[n] holds the
+  // rail list at the *start* of segment n; STATE.conns[n] holds the conns
+  // emitted *during* segment n.
+  const STATE = {
+    rails: [],
+    conns: [],
+    length: 0,
+    keyParams: '',
+    _lastEnd: null,
+    _eventBuckets: null,
+  };
+
+  function stateKey() {
+    if (MODE === 'scripted') {
+      return `s|${LOOP_SEGS}|${LANE_COUNT}|${ACTIVE.map(e =>
+        `${e.seg},${String(e.type).toUpperCase()},${e.from},${e.to ?? ''}`).join(';')}`;
+    }
+    return `p|${LANE_COUNT}|${SEED}|${MERGE_CHANCE}|${SPLIT_CHANCE}|${MAX_TRACKS}`;
+  }
+
+  function stateReset() {
+    STATE.rails.length = 0;
+    STATE.conns.length = 0;
+    STATE.length = 0;
+    STATE.keyParams = stateKey();
+    STATE._lastEnd = null;
+    STATE._eventBuckets = (MODE === 'scripted') ? bucketEvents() : null;
+    rngReset(SEED);
+  }
+
+  function ensureUpTo(n) {
+    if (STATE.keyParams !== stateKey()) stateReset();
+    while (STATE.length <= n) {
+      const startRails = STATE.length === 0
+        ? initialRails()
+        : copyRails(STATE._lastEnd);
+      let result;
+      if (MODE === 'scripted') {
+        const events = STATE._eventBuckets[mod(STATE.length, LOOP_SEGS)] || [];
+        result = stepSegmentRails(startRails, events);
+      } else {
+        result = generateLogicProceduralRails(startRails);
+      }
+      STATE.rails.push(startRails);
+      STATE.conns.push(result.conns);
+      STATE._lastEnd = result.endRails;
+      STATE.length++;
+    }
+  }
+
+  // ── Public queries ───────────────────────────────────────────────────────
+  function activeLanesAt(n) {
+    const idx = n | 0;
+    if (idx < 0) return [];
+    ensureUpTo(idx);
+    const rails = STATE.rails[idx];
+    const lanes = new Set(rails.map(r => r.lane));
+    return [...lanes];
+  }
+
+  function connectionsAt(n) {
+    const idx = n | 0;
+    if (idx < 0) return [];
+    ensureUpTo(idx);
+    return STATE.conns[idx];
+  }
+
+  function stationWeight(n, windowN = 3) {
+    let wsum = 0, acc = 0;
+    const sigma = Math.max(1, windowN) / 2;
+    for (let d = -windowN; d <= windowN; d++) {
+      const w = Math.exp(-(d * d) / (2 * sigma * sigma));
+      wsum += w;
+      if (activeLanesAt(n + d).length === 1) acc += w;
+    }
+    return acc / wsum;
+  }
+
+  function ownerLane(y1, y2) {
+    if (y1 === y2) return y1;
+    const c = CENTER_IDX();
+    return Math.abs(y1 - c) > Math.abs(y2 - c) ? y1 : y2;
+  }
+
+  // ── Setters ──────────────────────────────────────────────────────────────
+  function setScript(n)        { if (SCRIPTS[n]) { ACTIVE = SCRIPTS[n]; stateReset(); } }
+  function setLoopSegs(n)      { LOOP_SEGS = n;  stateReset(); }
+  function setSegW(w)          { SEG_W = w; }
+  function setCenterY(y)       { CENTER_Y = y; }
+  function setLaneSpace(s)     { LANE_SPACE = s; }
+  function setLaneCount(n)     { LANE_COUNT = n; stateReset(); }
+  function setMode(m) {
+    const mm = (m === 'procedural') ? 'procedural' : 'scripted';
+    if (MODE !== mm) { MODE = mm; stateReset(); }
+  }
+  function setSeed(s)          { SEED = (s >>> 0) || 1; stateReset(); }
+  function setMergeChance(c)   { MERGE_CHANCE = Math.max(0, Math.min(1, +c)); stateReset(); }
+  function setSplitChance(c)   { SPLIT_CHANCE = Math.max(0, Math.min(1, +c)); stateReset(); }
+  function setMaxTracks(n)     { MAX_TRACKS = Math.max(1, n | 0); stateReset(); }
+  function reroll()            { stateReset(); }
+
+  return {
+    SCRIPTS,
+    MAX_RAILS,
+    get LOOP_SEGS() { return LOOP_SEGS; },
+    get SEG_W()     { return SEG_W; },
+    get CENTER_Y()  { return CENTER_Y; },
+    get LANE_SPACE(){ return LANE_SPACE; },
+    get LANE_COUNT(){ return LANE_COUNT; },
+    // Rails are persistent in this model — camera should never wrap, since
+    // wrapping would re-show the initial (1-rail) state instead of the
+    // accumulated topology.
+    get WORLD_LOOP(){ return Infinity; },
+    get MODE()      { return MODE; },
+    get SEED()      { return SEED; },
+    get MERGE_CHANCE() { return MERGE_CHANCE; },
+    get SPLIT_CHANCE() { return SPLIT_CHANCE; },
+    get MAX_TRACKS()   { return MAX_TRACKS; },
+    laneToY,
+    activeLanesAt, connectionsAt, stationWeight, ownerLane,
+    smoothstep,
+    setScript, setLoopSegs, setSegW, setCenterY, setLaneSpace, setLaneCount,
+    setMode, setSeed, setMergeChance, setSplitChance, setMaxTracks, reroll,
+  };
+})();
