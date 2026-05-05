@@ -244,6 +244,9 @@ const SIM = (() => {
       return `s|${LOOP_SEGS}|${LANE_COUNT}|${ACTIVE.map(e =>
         `${e.seg},${String(e.type).toUpperCase()},${e.from},${e.to ?? ''}`).join(';')}`;
     }
+    if (MODE === 'phasing') {
+      return `h|${LANE_COUNT}`;
+    }
     return `p|${LANE_COUNT}|${SEED}|${MERGE_CHANCE}|${SPLIT_CHANCE}|${MAX_TRACKS}`;
   }
 
@@ -267,6 +270,14 @@ const SIM = (() => {
       if (MODE === 'scripted') {
         const events = STATE._eventBuckets[mod(STATE.length, LOOP_SEGS)] || [];
         result = stepSegmentRails(startRails, events);
+      } else if (MODE === 'phasing') {
+        // Single straight rail forever. Pill phasing is a render-side effect.
+        const lane = Math.round(CENTER_IDX());
+        const rails = [{ id: 0, lane }];
+        result = {
+          conns:    [{ id: 0, y1: lane, y2: lane }],
+          endRails: rails,
+        };
       } else {
         result = generateLogicProceduralRails(startRails);
       }
@@ -319,7 +330,9 @@ const SIM = (() => {
   function setLaneSpace(s)     { LANE_SPACE = s; }
   function setLaneCount(n)     { LANE_COUNT = n; stateReset(); }
   function setMode(m) {
-    const mm = (m === 'procedural') ? 'procedural' : 'scripted';
+    const mm = (m === 'procedural') ? 'procedural'
+             : (m === 'phasing')    ? 'phasing'
+             : 'scripted';
     if (MODE !== mm) { MODE = mm; stateReset(); }
   }
   function setSeed(s)          { SEED = (s >>> 0) || 1; stateReset(); }

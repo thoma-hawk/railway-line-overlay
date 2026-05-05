@@ -96,6 +96,61 @@
       color: #666;
       line-height: 1.4;
     }
+    /* Modulator cards — compact rows of inputs, one card per active LFO. */
+    .mod-card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 4px;
+      padding: 6px;
+      margin-bottom: 6px;
+    }
+    .mod-card.disabled { opacity: 0.5; }
+    .mod-row {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      margin-bottom: 3px;
+    }
+    .mod-row > * { flex: 1; }
+    .mod-card select,
+    .mod-card input[type="number"] {
+      background: rgba(255,255,255,0.05);
+      color: #e9e9e9;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 3px;
+      padding: 2px 4px;
+      font: 10px ui-monospace, monospace;
+      min-width: 0;
+      width: 100%;
+    }
+    .mod-card .mod-num {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      font: 9px ui-monospace, monospace;
+      color: #8a94a0;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .mod-card .mod-remove {
+      background: rgba(255,255,255,0.06);
+      color: #9aa4b0;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 3px;
+      width: 22px;
+      height: 22px;
+      font: 14px/1 ui-monospace, monospace;
+      cursor: pointer;
+      flex: 0 0 22px;
+    }
+    .mod-card .mod-remove:hover { color: #fff; }
+    .mod-toggle {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      font: 10px ui-monospace, monospace;
+      color: #c4c8cd;
+    }
     body.dragging-preset::after {
       content: 'Drop preset to load';
       position: fixed; inset: 0;
@@ -140,6 +195,7 @@
           <select data-k="simMode">
             <option value="scripted">Scripted (looping preset)</option>
             <option value="procedural">Procedural (seeded roll)</option>
+            <option value="phasing">Phasing (one rail, two pill voices)</option>
           </select>
         </label>
         <div id="scripted-only">
@@ -159,6 +215,20 @@
           <label>Merge chance <input type="range" min="0" max="1" step="0.01" data-k="mergeChance"><span data-v="mergeChance"></span></label>
           <label>Split chance <input type="range" min="0" max="1" step="0.01" data-k="splitChance"><span data-v="splitChance"></span></label>
           <label>Max tracks <input type="range" min="1" max="9" step="1" data-k="maxTracks"><span data-v="maxTracks"></span></label>
+        </div>
+        <div id="phasing-only" class="sub-block">
+          <div class="sub-head">Phasing pills</div>
+          <label>Pill spacing <input type="range" min="40" max="800" step="1" data-k="phasePillSpacing"><span data-v="phasePillSpacing"></span></label>
+          <label>Pill length <input type="range" min="4" max="400" step="1" data-k="phasePillLength"><span data-v="phasePillLength"></span></label>
+          <label>Pill height <input type="range" min="2" max="200" step="1" data-k="phasePillHeight"><span data-v="phasePillHeight"></span></label>
+          <label>Group A opacity <input type="range" min="0" max="1" step="0.01" data-k="phasePillOpacityA"><span data-v="phasePillOpacityA"></span></label>
+          <label>Color A <input type="color" data-k="phaseColorA"></label>
+        </div>
+        <div id="modulators-block" class="sub-block">
+          <div class="sub-head">Modulators</div>
+          <div id="modulators-list"></div>
+          <button class="preset-btn" id="add-modulator">+ Add modulator</button>
+          <div class="preset-hint">LFO-modulate any value around its sweet spot.</div>
         </div>
       </section>
 

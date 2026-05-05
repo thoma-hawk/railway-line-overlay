@@ -79,8 +79,22 @@ const CONFIG = {
   inkTrapWidth:     368,      // hill half-width (world units)
   inkTrapDirection: 0.28,     // 0 = all upward, 1 = all downward, 0.5 = mixed
 
+  // ── Phasing pills — single-group sleepers along a straight rail.
+  // The simulator emits one rail forever; the renderer paints repeating
+  // capsule "sleepers" inside the rail body. Animation/phasing effects
+  // come from user-defined modulators (see CONFIG.modulators), not from
+  // any built-in LFO — modulate camera speed, pill spacing, etc. to drive
+  // the visual.
+  // Only active when simMode === 'phasing'; defaults model
+  // svg/sleepers_phasing.svg: vertical capsules, olive on a yellow bar.
+  phasePillSpacing:  137,
+  phasePillLength:   19,
+  phasePillHeight:   68,
+  phasePillOpacityA: 1,
+  phaseColorA:       '#a2a792',
+
   // Simulation
-  simMode:      'procedural',  // 'scripted' | 'procedural'
+  simMode:      'procedural',  // 'scripted' | 'procedural' | 'phasing'
   simScript:    'v1',
   loopSegs:     30,
   seed:         1,
@@ -91,6 +105,11 @@ const CONFIG = {
   // PNG sequence export
   exportFrames: 120,
   exportFps:    30,
+
+  // LFO modulators — each entry is { target, sweetSpot, amount, cycle,
+  // waveform, enabled, t }. Edit/add via the Modulators panel; persisted
+  // via preset save/load.
+  modulators: [],
 };
 
 // Snapshot of the baked-in defaults — used by the "Revert to defaults"
@@ -210,6 +229,15 @@ const mat = new THREE.ShaderMaterial({
     uInkTrapWidth:     { value: CONFIG.inkTrapWidth },
     uInkTrapDirection: { value: CONFIG.inkTrapDirection },
 
+    // Phasing pills (group A only)
+    uPhaseEnabled:    { value: 0 },
+    uPhaseSpacing:    { value: CONFIG.phasePillSpacing },
+    uPhaseLength:     { value: CONFIG.phasePillLength },
+    uPhaseHeight:     { value: CONFIG.phasePillHeight },
+    uPhaseOffsetA:    { value: 0 },
+    uPhaseOpacityA:   { value: CONFIG.phasePillOpacityA },
+    uPhaseColorA:     { value: new THREE.Color(CONFIG.phaseColorA) },
+
     // Topology
     uLaneData:    { value: laneDataTex },
     uCameraX:     { value: 0 },
@@ -254,6 +282,14 @@ const mat = new THREE.ShaderMaterial({
     uniform float uInkTrapDensity;
     uniform float uInkTrapWidth;
     uniform float uInkTrapDirection;
+
+    uniform float uPhaseEnabled;
+    uniform float uPhaseSpacing;
+    uniform float uPhaseLength;
+    uniform float uPhaseHeight;
+    uniform float uPhaseOffsetA;
+    uniform float uPhaseOpacityA;
+    uniform vec3  uPhaseColorA;
 
     uniform sampler2D uLaneData;
     uniform float     uCameraX;
@@ -433,6 +469,24 @@ const mat = new THREE.ShaderMaterial({
       return vec4(dst, maxA);
     }
 
+    // Repeating pill SDF mask — period 'spacing' along world-X, centered on
+    // lane Y. Pill = rounded rect; corner radius is half of the shorter
+    // side so both horizontal and vertical capsule shapes work.
+    // 'offset' shifts the pattern in world-X so each voice can drift.
+    float phasePillMask(float wx, float wy, float laneY, float offset, float spacing) {
+      float sp      = max(spacing, 1.0);
+      float ux      = mod(wx - offset, sp) - sp * 0.5;
+      float halfL   = max(uPhaseLength * 0.5, 0.5);
+      float halfH   = max(uPhaseHeight * 0.5, 0.5);
+      float r       = min(halfL, halfH);
+      float dx      = abs(ux)           - (halfL - r);
+      float dy      = abs(wy - laneY)   - (halfH - r);
+      vec2  q       = max(vec2(dx, dy), 0.0);
+      float d       = length(q) + min(max(dx, dy), 0.0) - r;
+      float aa      = max(fwidth(wx) + fwidth(wy), 1e-4);
+      return 1.0 - smoothstep(-aa, aa, d);
+    }
+
     void main() {
       // Screen → world. viewH = world units that fit vertically; uZoom
       // scales it (smaller zoom = see more).
@@ -445,7 +499,18 @@ const mat = new THREE.ShaderMaterial({
       // drawRailTopology already starts dst at uBgColor, so no extra bg
       // composite needed in main().
       vec4 rail = drawRailTopology(wx, wy);
-      gl_FragColor = vec4(rail.rgb, 1.0);
+      vec3 col  = rail.rgb;
+
+      // Phasing pills sit *inside* the rail body — the pill mask is gated by
+      // the rail's own coverage so pills can never paint outside the strip.
+      if (uPhaseEnabled > 0.5 && rail.a > 1e-3) {
+        float laneY = 0.0;  // single rail at lane center; CENTER_Y is 0
+        float mA = phasePillMask(wx, wy, laneY, uPhaseOffsetA, uPhaseSpacing) * rail.a
+                 * clamp(uPhaseOpacityA, 0.0, 1.0);
+        col = mix(col, uPhaseColorA, mA);
+      }
+
+      gl_FragColor = vec4(col, 1.0);
     }
   `,
 });
@@ -461,6 +526,99 @@ function updateResolution() {
 window.addEventListener('resize', updateResolution);
 updateResolution();
 
+// ── Modulators — generic LFO automation for any allowlisted CONFIG key.
+// Each entry runs a wave shape over `cycle` seconds, computes
+// sweetSpot + amount × wave(phase), clamps to the target's range, and
+// writes back into CONFIG. _applyConfigCore() then pushes the new value to
+// the relevant uniform/SIM call. Skips buildMinimap() to keep cost low.
+const MOD_TARGETS = [
+  { key: 'speed',             label: 'Camera speed',  min: 0,    max: 30000, step: 1     },
+  { key: 'viewZoom',          label: 'Zoom',          min: 0.05, max: 2,     step: 0.01  },
+  { key: 'segW',              label: 'Segment width', min: 40,   max: 8000,  step: 1     },
+  { key: 'laneSpace',         label: 'Lane spacing',  min: 40,   max: 600,   step: 1     },
+  { key: 'railWidth',         label: 'Rail width',    min: 4,    max: 200,   step: 1     },
+  { key: 'railSoft',          label: 'Rail soft',     min: 0,    max: 1,     step: 0.01  },
+  { key: 'railSigma',         label: 'Rail sigma',    min: 0.2,  max: 1.5,   step: 0.01  },
+  { key: 'railOpacity',       label: 'Rail opacity',  min: 0,    max: 1,     step: 0.01  },
+  { key: 'tickAmount',        label: 'Tick amount',   min: 0,    max: 1,     step: 0.01  },
+  { key: 'tickSpacing',       label: 'Tick spacing',  min: 20,   max: 2000,  step: 1     },
+  { key: 'tickWidth',         label: 'Tick width',    min: 2,    max: 500,   step: 1     },
+  { key: 'inkTrapAmount',     label: 'Ink trap amt',  min: 0,    max: 400,   step: 1     },
+  { key: 'inkTrapWidth',      label: 'Ink trap width',min: 20,   max: 800,   step: 1     },
+  { key: 'inkTrapDensity',    label: 'Ink trap dens', min: 0,    max: 1,     step: 0.01  },
+  { key: 'phasePillSpacing',  label: 'Pill spacing',  min: 20,   max: 800,   step: 1     },
+  { key: 'phasePillLength',   label: 'Pill length',   min: 4,    max: 400,   step: 1     },
+  { key: 'phasePillHeight',   label: 'Pill height',   min: 2,    max: 200,   step: 1     },
+  { key: 'phasePillOpacityA', label: 'Pill opacity',  min: 0,    max: 1,     step: 0.01  },
+];
+// Each waveform is a "shape function" 0..1 → 0..1 over one cycle. The
+// stepModulator code lerps min..max by the shape's output. The shape
+// determines both timing (sharp vs eased extremes) and asymmetry
+// (saw-up ramps then snaps, saw-down snaps then ramps). Triangle-based
+// shapes use the helper `t` = 1 - 2|p - 0.5| (ramps 0→1→0 across cycle)
+// so the easing applies symmetrically to both halves.
+const MOD_WAVEFORMS = [
+  { key: 'sin',      label: 'Sine',          fn: (p) => 0.5 - 0.5 * Math.cos(2 * Math.PI * p) },
+  { key: 'tri',      label: 'Linear',        fn: (p) => 1 - 2 * Math.abs(p - 0.5) },
+  { key: 'smooth',   label: 'Smooth',        fn: (p) => { const t = 1 - 2 * Math.abs(p - 0.5); return t * t * (3 - 2 * t); } },
+  { key: 'smoother', label: 'Smoother',      fn: (p) => { const t = 1 - 2 * Math.abs(p - 0.5); return t * t * t * (t * (t * 6 - 15) + 10); } },
+  { key: 'easeIn',   label: 'Ease in',       fn: (p) => { const t = 1 - 2 * Math.abs(p - 0.5); return t * t * t; } },
+  { key: 'easeOut',  label: 'Ease out',      fn: (p) => { const t = 1 - 2 * Math.abs(p - 0.5); const u = 1 - t; return 1 - u * u * u; } },
+  { key: 'sq',       label: 'Hold',          fn: (p) => p < 0.5 ? 1 : 0 },
+  { key: 'sawUp',    label: 'Saw ↑ (ramp)',  fn: (p) => p },
+  { key: 'sawDown',  label: 'Saw ↓ (snap)',  fn: (p) => 1 - p },
+];
+// Migrate any pre-min/max modulators (sweetSpot + amount) to the new shape
+// in place, so old presets keep working.
+function migrateModulator(m) {
+  if (!m) return;
+  if (typeof m.min !== 'number' || typeof m.max !== 'number') {
+    const ss  = (typeof m.sweetSpot === 'number') ? m.sweetSpot : 0;
+    const amt = (typeof m.amount    === 'number') ? m.amount    : 0;
+    m.min = ss - amt;
+    m.max = ss + amt;
+  }
+}
+function stepModulators(dt) {
+  const list = CONFIG.modulators;
+  if (!Array.isArray(list) || list.length === 0) return;
+  let touched = false;
+  for (const m of list) {
+    if (!m || !m.enabled) continue;
+    migrateModulator(m);
+    const tgt = MOD_TARGETS.find(t => t.key === m.target);
+    if (!tgt) continue;
+    const cycle = Math.max(m.cycle || 0.05, 0.05);
+    m.t = (((m.t || 0) + dt) % cycle + cycle) % cycle;
+    const wave = (MOD_WAVEFORMS.find(w => w.key === m.waveform) || MOD_WAVEFORMS[0]).fn;
+    const v01  = wave(m.t / cycle);                        // shape fn returns 0..1
+    let val    = m.min + (m.max - m.min) * v01;
+    val = Math.max(tgt.min, Math.min(tgt.max, val));
+    CONFIG[m.target] = val;
+    touched = true;
+  }
+  if (touched) {
+    _applyConfigCore(true);
+    syncModulatedSliders();
+  }
+}
+// Push live modulated values into their slider + readout so the user sees
+// the wobble. Only touches inputs whose data-k matches an enabled modulator.
+function syncModulatedSliders() {
+  for (const m of CONFIG.modulators || []) {
+    if (!m || !m.enabled) continue;
+    const v = CONFIG[m.target];
+    if (typeof v !== 'number') continue;
+    const inp = document.querySelector(`#panel input[data-k="${m.target}"]`);
+    if (inp) inp.value = v;
+    const ro = document.querySelector(`#panel [data-v="${m.target}"]`);
+    if (ro) {
+      if (ro.tagName === 'INPUT') ro.value = v;
+      else ro.textContent = v.toFixed(2);
+    }
+  }
+}
+
 // ── Animation loop ───────────────────────────────────────────────────────
 const clock = new THREE.Clock();
 let exporting = false;   // when true, the export loop drives sim/render manually
@@ -475,6 +633,10 @@ function tick() {
 
   const dt = clock.getDelta();
   mat.uniforms.uTime.value += dt;
+
+  // Run user-defined LFO modulators first so any value they touch — including
+  // CONFIG.speed itself — is current when the rest of the frame uses it.
+  stepModulators(dt);
 
   WORLD.cameraX += CONFIG.speed * dt;
   const worldLoop = SIM.WORLD_LOOP;
@@ -532,6 +694,7 @@ async function exportPngSequence() {
 
       // Advance one frame's worth of sim, then render.
       mat.uniforms.uTime.value += dt;
+      stepModulators(dt);
       WORLD.cameraX += CONFIG.speed * dt;
       rebuildLaneData();
       mat.uniforms.uCameraX.value     = WORLD.cameraX;
@@ -580,7 +743,34 @@ function blendModeIdx(name) {
   return i < 0 ? 0 : i;
 }
 
+// Tracks the previous simMode across applyConfig() calls so we can detect
+// the moment the user switches into phasing and seed it with sleeper-look
+// defaults — but only if they haven't already moved those fields away from
+// the global defaults.
+let _prevSimMode = null;
+
 function applyConfig() {
+  if (CONFIG.simMode === 'phasing' && _prevSimMode !== 'phasing') {
+    if (CONFIG.railWidth   === DEFAULT_CONFIG.railWidth)   CONFIG.railWidth   = 54;
+    if (CONFIG.railSoft    === DEFAULT_CONFIG.railSoft)    CONFIG.railSoft    = 0;
+    if (CONFIG.railSigma   === DEFAULT_CONFIG.railSigma)   CONFIG.railSigma   = 0.2;
+    if (CONFIG.railOpacity === DEFAULT_CONFIG.railOpacity) CONFIG.railOpacity = 1;
+    if (CONFIG.bgColor     === DEFAULT_CONFIG.bgColor)     CONFIG.bgColor     = '#f4f3ea';
+    if (CONFIG.viewZoom    === DEFAULT_CONFIG.viewZoom)    CONFIG.viewZoom    = 0.6;
+    // Yellow bar like the SVG; only override the first lane swatch (rail 0
+    // is the only rail in phasing mode).
+    if (Array.isArray(CONFIG.laneColors) &&
+        CONFIG.laneColors[0] === DEFAULT_CONFIG.laneColors[0]) {
+      CONFIG.laneColors[0] = '#ffc83d';
+    }
+    syncPanelToConfig();
+  }
+  _prevSimMode = CONFIG.simMode;
+
+  _applyConfigCore();
+}
+
+function _applyConfigCore(skipMinimap) {
   mat.uniforms.uZoom.value        = CONFIG.viewZoom;
   mat.uniforms.uRailWidth.value   = CONFIG.railWidth;
   mat.uniforms.uRailSoft.value    = CONFIG.railSoft;
@@ -605,6 +795,13 @@ function applyConfig() {
   mat.uniforms.uInkTrapWidth.value     = CONFIG.inkTrapWidth;
   mat.uniforms.uInkTrapDirection.value = CONFIG.inkTrapDirection;
 
+  mat.uniforms.uPhaseEnabled.value  = (CONFIG.simMode === 'phasing') ? 1 : 0;
+  mat.uniforms.uPhaseSpacing.value  = CONFIG.phasePillSpacing;
+  mat.uniforms.uPhaseLength.value   = CONFIG.phasePillLength;
+  mat.uniforms.uPhaseHeight.value   = CONFIG.phasePillHeight;
+  mat.uniforms.uPhaseOpacityA.value = CONFIG.phasePillOpacityA;
+  mat.uniforms.uPhaseColorA.value.set(CONFIG.phaseColorA);
+
   SIM.setScript(CONFIG.simScript);
   SIM.setLoopSegs(CONFIG.loopSegs);
   SIM.setSegW(CONFIG.segW);
@@ -621,10 +818,12 @@ function applyConfig() {
   // Mode-conditional panel sections — hide knobs that don't apply.
   const scriptedOnly   = document.getElementById('scripted-only');
   const proceduralOnly = document.getElementById('procedural-only');
+  const phasingOnly    = document.getElementById('phasing-only');
   if (scriptedOnly)   scriptedOnly.style.display   = CONFIG.simMode === 'scripted'   ? '' : 'none';
   if (proceduralOnly) proceduralOnly.style.display = CONFIG.simMode === 'procedural' ? '' : 'none';
+  if (phasingOnly)    phasingOnly.style.display    = CONFIG.simMode === 'phasing'    ? '' : 'none';
 
-  buildMinimap();
+  if (!skipMinimap) buildMinimap();
 }
 
 // ── Minimap ──────────────────────────────────────────────────────────────
@@ -977,6 +1176,141 @@ function bindGlobalControls() {
     });
   }
 
+  // ── Modulators panel ────────────────────────────────────────────────────
+  function rebuildModulatorsList() {
+    const root = document.getElementById('modulators-list');
+    if (!root) return;
+    root.innerHTML = '';
+    CONFIG.modulators = CONFIG.modulators || [];
+    // Drop any modulator whose target was removed from MOD_TARGETS so old
+    // presets don't render stale rows.
+    const validKeys = new Set(MOD_TARGETS.map(t => t.key));
+    CONFIG.modulators = CONFIG.modulators.filter(m => m && validKeys.has(m.target));
+    CONFIG.modulators.forEach((m, idx) => root.appendChild(renderModCard(m, idx)));
+  }
+  function renderModCard(m, idx) {
+    const card = document.createElement('div');
+    card.className = 'mod-card' + (m.enabled ? '' : ' disabled');
+    card.dataset.idx = idx;
+
+    // Row 1: target select + remove button.
+    const row1 = document.createElement('div');
+    row1.className = 'mod-row';
+    const sel = document.createElement('select');
+    for (const t of MOD_TARGETS) {
+      const opt = document.createElement('option');
+      opt.value = t.key; opt.textContent = t.label;
+      if (t.key === m.target) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener('change', () => {
+      m.target = sel.value;
+      // Re-anchor the new target's range around its current value so the
+      // user starts from "stays put" rather than an arbitrary span.
+      const tgtNew = MOD_TARGETS.find(t => t.key === m.target) || MOD_TARGETS[0];
+      const cur    = CONFIG[m.target];
+      const range  = (tgtNew.max - tgtNew.min) * 0.1;
+      if (typeof cur === 'number') {
+        m.min = cur;
+        m.max = cur + range;
+      }
+      rebuildModulatorsList();
+    });
+    row1.appendChild(sel);
+    const rm = document.createElement('button');
+    rm.className = 'mod-remove';
+    rm.textContent = '×';
+    rm.title = 'Remove';
+    rm.addEventListener('click', () => {
+      CONFIG.modulators.splice(idx, 1);
+      rebuildModulatorsList();
+    });
+    row1.appendChild(rm);
+    card.appendChild(row1);
+
+    const tgt = MOD_TARGETS.find(t => t.key === m.target) || MOD_TARGETS[0];
+    migrateModulator(m);
+
+    // Row 2: min + max — wave is mapped 0..1 across [min, max] so an
+    // asymmetric range like 1200..2400 stays at 1200 minimum.
+    const row2 = document.createElement('div');
+    row2.className = 'mod-row';
+    row2.appendChild(makeNumLabel('Min', m.min, tgt.step, (v) => m.min = v));
+    row2.appendChild(makeNumLabel('Max', m.max, tgt.step, (v) => m.max = v));
+    card.appendChild(row2);
+
+    // Row 3: cycle + waveform.
+    const row3 = document.createElement('div');
+    row3.className = 'mod-row';
+    row3.appendChild(makeNumLabel('Cycle s', m.cycle, 0.1, (v) => m.cycle = Math.max(0.05, v)));
+    const wsel = document.createElement('select');
+    for (const w of MOD_WAVEFORMS) {
+      const opt = document.createElement('option');
+      opt.value = w.key; opt.textContent = w.label;
+      if (w.key === m.waveform) opt.selected = true;
+      wsel.appendChild(opt);
+    }
+    wsel.addEventListener('change', () => { m.waveform = wsel.value; });
+    row3.appendChild(wsel);
+    card.appendChild(row3);
+
+    // Row 4: enabled toggle.
+    const row4 = document.createElement('div');
+    row4.className = 'mod-row';
+    const tg = document.createElement('label');
+    tg.className = 'mod-toggle';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!m.enabled;
+    cb.addEventListener('change', () => {
+      m.enabled = cb.checked;
+      card.classList.toggle('disabled', !m.enabled);
+    });
+    tg.appendChild(cb);
+    tg.appendChild(document.createTextNode(' enabled'));
+    row4.appendChild(tg);
+    card.appendChild(row4);
+
+    return card;
+  }
+  function makeNumLabel(text, val, step, onChange) {
+    const lab = document.createElement('label');
+    lab.className = 'mod-num';
+    lab.appendChild(document.createTextNode(text));
+    const inp = document.createElement('input');
+    inp.type = 'number';
+    inp.step = step;
+    inp.value = val;
+    inp.addEventListener('input', () => {
+      const v = parseFloat(inp.value);
+      if (!Number.isNaN(v)) onChange(v);
+    });
+    lab.appendChild(inp);
+    return lab;
+  }
+  function addModulator() {
+    const tgt = MOD_TARGETS[0];
+    const cur = CONFIG[tgt.key];
+    const span = (tgt.max - tgt.min) * 0.1;
+    const min  = (typeof cur === 'number') ? cur : tgt.min;
+    CONFIG.modulators = CONFIG.modulators || [];
+    CONFIG.modulators.push({
+      target:   tgt.key,
+      min:      min,
+      max:      Math.min(min + span, tgt.max),
+      cycle:    6,
+      waveform: 'sin',
+      enabled:  true,
+      t:        0,
+    });
+    rebuildModulatorsList();
+  }
+  // Expose for syncPanelToConfig (preset load/revert) and initial render.
+  window._railwayRebuildModulators = rebuildModulatorsList;
+  const addBtn = document.getElementById('add-modulator');
+  if (addBtn) addBtn.addEventListener('click', addModulator);
+  rebuildModulatorsList();
+
   // Collapse button.
   const toggle = document.getElementById('panel-toggle');
   const panel  = document.getElementById('panel');
@@ -1010,6 +1344,9 @@ function syncPanelToConfig() {
     const c = CONFIG.laneColors && CONFIG.laneColors[i];
     if (c) el.value = c;
   });
+  if (typeof window._railwayRebuildModulators === 'function') {
+    window._railwayRebuildModulators();
+  }
 }
 
 bindGlobalControls();
