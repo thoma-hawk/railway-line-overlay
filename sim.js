@@ -44,6 +44,59 @@ const SIM = (() => {
 
   let ACTIVE = SCRIPTS.v1;
 
+  // Built-in convergence patterns — three rails at lanes 0/3/6 always start
+  // and end the loop at those lanes, but how they stack at the merge segment
+  // (seg 8) varies. Lane positions are floats so rails can sit at sub-lane
+  // offsets (rendered as-is, no width thinning).
+  //   adjacent — order preserved, lanes 2/3/4 (touching)
+  //   stacked  — heavy overlap near centre (2.85/3/3.15)
+  //   swap     — yellow→top, red→middle, purple→bottom (lanes 2.5/3.5/4.5)
+  //   gap      — yellow+red touching at top, purple separated (2/3/5)
+  //   inverted — full reverse: purple→top, yellow stays, red→bottom
+  const CONV_PATTERNS = {
+    adjacent: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 0, to: 2 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 4 },
+      { seg: 16, type: 'MERGE', from: 2, to: 0 },
+      { seg: 16, type: 'MERGE', from: 4, to: 6 },
+    ],
+    stacked: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 0, to: 2.85 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 3.15 },
+      { seg: 16, type: 'MERGE', from: 2.85, to: 0 },
+      { seg: 16, type: 'MERGE', from: 3.15, to: 6 },
+    ],
+    swap: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 0, to: 3.5 },
+      { seg: 8,  type: 'MERGE', from: 3, to: 2.5 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 4.5 },
+      { seg: 16, type: 'MERGE', from: 3.5, to: 0 },
+      { seg: 16, type: 'MERGE', from: 2.5, to: 3 },
+      { seg: 16, type: 'MERGE', from: 4.5, to: 6 },
+    ],
+    gap: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 3, to: 2 },
+      { seg: 8,  type: 'MERGE', from: 0, to: 3 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 5 },
+      { seg: 16, type: 'MERGE', from: 2, to: 3 },
+      { seg: 16, type: 'MERGE', from: 3, to: 0 },
+      { seg: 16, type: 'MERGE', from: 5, to: 6 },
+    ],
+    inverted: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 0, to: 4 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 2 },
+      { seg: 16, type: 'MERGE', from: 4, to: 0 },
+      { seg: 16, type: 'MERGE', from: 2, to: 6 },
+    ],
+  };
+  let CONV_SCRIPT = CONV_PATTERNS.adjacent;
+  const CONV_LOOP = 24;
+
   let MODE = 'scripted';
 
   let MERGE_CHANCE = 0.4;
@@ -92,11 +145,12 @@ const SIM = (() => {
   // else default to lane 3 (or last lane if LANE_COUNT < 4).
   function initialRails() {
     const lanes = [];
-    const init = ACTIVE.find(e => String(e.type).toUpperCase() === 'INIT');
+    const list = (MODE === 'convergence') ? CONV_SCRIPT : ACTIVE;
+    const init = list.find(e => String(e.type).toUpperCase() === 'INIT');
     if (init) {
       for (const tok of String(init.from).replace(/,/g, ' ').split(/\s+/)) {
-        const i = parseInt(tok, 10);
-        if (Number.isInteger(i) && i >= 0 && i < LANE_COUNT) lanes.push(i);
+        const i = parseFloat(tok);
+        if (Number.isFinite(i) && i >= 0 && i < LANE_COUNT) lanes.push(i);
       }
     }
     if (lanes.length === 0) lanes.push(Math.min(3, LANE_COUNT - 1));
@@ -104,14 +158,17 @@ const SIM = (() => {
   }
 
   // Bucket events by loop-seg (INIT filtered).
-  function bucketEvents() {
+  function bucketEventsFromList(list, loopSize) {
     const b = {};
-    for (const e of ACTIVE) {
+    for (const e of list) {
       if (String(e.type).toUpperCase() === 'INIT') continue;
-      const s = mod(e.seg, LOOP_SEGS);
+      const s = mod(e.seg, loopSize);
       (b[s] = b[s] || []).push(e);
     }
     return b;
+  }
+  function bucketEvents() {
+    return bucketEventsFromList(ACTIVE, LOOP_SEGS);
   }
 
   // ── Step segment for scripted mode ───────────────────────────────────────
@@ -128,8 +185,8 @@ const SIM = (() => {
     const splitsBySrc = new Map();
     for (const ev of events) {
       if (String(ev.type).toUpperCase() !== 'SPLIT') continue;
-      const la = parseInt(ev.from, 10);
-      if (!Number.isInteger(la)) continue;
+      const la = parseFloat(ev.from);
+      if (!Number.isFinite(la)) continue;
       if (!splitsBySrc.has(la)) splitsBySrc.set(la, []);
       splitsBySrc.get(la).push(ev);
     }
@@ -145,8 +202,8 @@ const SIM = (() => {
         ...endRails.map(r => r.id),
       ]);
       for (const ev of evs) {
-        const lb = ev.to !== undefined ? parseInt(ev.to, 10) : null;
-        if (lb === null || lb < 0 || lb >= LANE_COUNT) continue;
+        const lb = ev.to !== undefined ? parseFloat(ev.to) : NaN;
+        if (!Number.isFinite(lb) || lb < 0 || lb >= LANE_COUNT) continue;
         const newId = nextAvailableId(usedIds);
         if (newId === -1) continue;     // rail-cap hit
         usedIds.add(newId);
@@ -159,9 +216,9 @@ const SIM = (() => {
     // ends up overlapping whatever rail was already at `to`.
     for (const ev of events) {
       if (String(ev.type).toUpperCase() !== 'MERGE') continue;
-      const la = parseInt(ev.from, 10);
-      const lb = ev.to !== undefined ? parseInt(ev.to, 10) : null;
-      if (lb === null || lb < 0 || lb >= LANE_COUNT) continue;
+      const la = parseFloat(ev.from);
+      const lb = ev.to !== undefined ? parseFloat(ev.to) : NaN;
+      if (!Number.isFinite(la) || !Number.isFinite(lb) || lb < 0 || lb >= LANE_COUNT) continue;
       const rail = rails.find(r => r.lane === la && !handled.has(r.id));
       if (!rail) continue;
       conns.push({ id: rail.id, y1: la, y2: lb });
@@ -247,6 +304,10 @@ const SIM = (() => {
     if (MODE === 'phasing') {
       return `h|${LANE_COUNT}`;
     }
+    if (MODE === 'convergence') {
+      return `c|${LANE_COUNT}|${CONV_SCRIPT.map(e =>
+        `${e.seg},${String(e.type).toUpperCase()},${e.from},${e.to ?? ''}`).join(';')}`;
+    }
     return `p|${LANE_COUNT}|${SEED}|${MERGE_CHANCE}|${SPLIT_CHANCE}|${MAX_TRACKS}`;
   }
 
@@ -256,7 +317,9 @@ const SIM = (() => {
     STATE.length = 0;
     STATE.keyParams = stateKey();
     STATE._lastEnd = null;
-    STATE._eventBuckets = (MODE === 'scripted') ? bucketEvents() : null;
+    STATE._eventBuckets = (MODE === 'scripted') ? bucketEvents()
+                       : (MODE === 'convergence') ? bucketEventsFromList(CONV_SCRIPT, CONV_LOOP)
+                       : null;
     rngReset(SEED);
   }
 
@@ -278,6 +341,11 @@ const SIM = (() => {
           conns:    [{ id: 0, y1: lane, y2: lane }],
           endRails: rails,
         };
+      } else if (MODE === 'convergence') {
+        // Built-in convergence loop (3 rails: spread → merge to centre →
+        // spread back). Renderer scales width by per-conn end-lane density.
+        const events = STATE._eventBuckets[mod(STATE.length, CONV_LOOP)] || [];
+        result = stepSegmentRails(startRails, events);
       } else {
         result = generateLogicProceduralRails(startRails);
       }
@@ -324,14 +392,21 @@ const SIM = (() => {
 
   // ── Setters ──────────────────────────────────────────────────────────────
   function setScript(n)        { if (SCRIPTS[n]) { ACTIVE = SCRIPTS[n]; stateReset(); } }
+  function setConvergencePattern(n) {
+    if (CONV_PATTERNS[n] && CONV_SCRIPT !== CONV_PATTERNS[n]) {
+      CONV_SCRIPT = CONV_PATTERNS[n];
+      stateReset();
+    }
+  }
   function setLoopSegs(n)      { LOOP_SEGS = n;  stateReset(); }
   function setSegW(w)          { SEG_W = w; }
   function setCenterY(y)       { CENTER_Y = y; }
   function setLaneSpace(s)     { LANE_SPACE = s; }
   function setLaneCount(n)     { LANE_COUNT = n; stateReset(); }
   function setMode(m) {
-    const mm = (m === 'procedural') ? 'procedural'
-             : (m === 'phasing')    ? 'phasing'
+    const mm = (m === 'procedural')  ? 'procedural'
+             : (m === 'phasing')     ? 'phasing'
+             : (m === 'convergence') ? 'convergence'
              : 'scripted';
     if (MODE !== mm) { MODE = mm; stateReset(); }
   }
@@ -363,5 +438,7 @@ const SIM = (() => {
     smoothstep,
     setScript, setLoopSegs, setSegW, setCenterY, setLaneSpace, setLaneCount,
     setMode, setSeed, setMergeChance, setSplitChance, setMaxTracks, reroll,
+    setConvergencePattern,
+    CONV_PATTERN_KEYS: Object.keys(CONV_PATTERNS),
   };
 })();

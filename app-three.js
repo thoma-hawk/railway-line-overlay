@@ -93,8 +93,18 @@ const CONFIG = {
   phasePillOpacityA: 1,
   phaseColorA:       '#a2a792',
 
+  // Stack pattern at the merge — each pattern is a hand-authored
+  // SPLIT/MERGE script in sim.js (CONV_PATTERNS) using sub-lane offsets
+  // for the rail end-positions.
+  convergencePattern: 'adjacent',
+  // 0..1 — narrows rails during the merge phase of the loop. Phase is
+  // derived per segment from the lane-range across all conns: full spread
+  // (rails at 0/3/6) → 0, fully merged (rails close together) → 1.
+  // 0 = constant width; 1 = rail vanishes at the merge.
+  convergenceTaper: 0,
+
   // Simulation
-  simMode:      'procedural',  // 'scripted' | 'procedural' | 'phasing'
+  simMode:      'procedural',  // 'scripted' | 'procedural' | 'phasing' | 'convergence'
   simScript:    'v1',
   loopSegs:     30,
   seed:         1,
@@ -171,6 +181,13 @@ laneDataTex.wrapS = THREE.ClampToEdgeWrapping;
 laneDataTex.wrapT = THREE.ClampToEdgeWrapping;
 laneDataTex.needsUpdate = true;
 
+// Per-segment merge phase (0 = spread, 1 = fully merged) — derived from
+// the lane-range across all conns at that segment. Used to taper rail
+// width through the loop's spread→merge→spread cycle, regardless of which
+// rail the conn belongs to.
+const segPhaseArray = new Float32Array(WORLD.bufferSegs);
+const PHASE_MAX_RANGE = 6;   // lanes 0..6 = full spread
+
 function rebuildLaneData() {
   const segW = CONFIG.segW;
   const cameraSeg = Math.floor(WORLD.cameraX / segW);
@@ -181,6 +198,7 @@ function rebuildLaneData() {
     const seg = originSeg + r;
     const conns = SIM.connectionsAt(seg);
     const sxWorld = seg * segW;
+    let yMin = Infinity, yMax = -Infinity;
     for (let c = 0; c < WORLD.maxSlots; c++) {
       const i = (r * WORLD.maxSlots + c) * 4;
       if (c < conns.length) {
@@ -190,12 +208,22 @@ function rebuildLaneData() {
         laneDataArray[i + 1] = SIM.laneToY(conn.y1);
         laneDataArray[i + 2] = SIM.laneToY(conn.y2);
         laneDataArray[i + 3] = id + 1;
+        if (conn.y2 < yMin) yMin = conn.y2;
+        if (conn.y2 > yMax) yMax = conn.y2;
       } else {
         laneDataArray[i    ] = 0;
         laneDataArray[i + 1] = 0;
         laneDataArray[i + 2] = 0;
         laneDataArray[i + 3] = 0;
       }
+    }
+    if (yMax === -Infinity) {
+      // No conns at this segment yet — treat as "fully spread" so the
+      // adjacent-row interpolation doesn't mistakenly narrow.
+      segPhaseArray[r] = 0;
+    } else {
+      const range = yMax - yMin;
+      segPhaseArray[r] = 1 - Math.min(1, range / PHASE_MAX_RANGE);
     }
   }
   laneDataTex.needsUpdate = true;
@@ -228,6 +256,11 @@ const mat = new THREE.ShaderMaterial({
     uInkTrapDensity:   { value: CONFIG.inkTrapDensity },
     uInkTrapWidth:     { value: CONFIG.inkTrapWidth },
     uInkTrapDirection: { value: CONFIG.inkTrapDirection },
+
+    // Convergence — flag enables per-conn merge tapering.
+    uConvergenceMode:  { value: 0 },
+    uConvergenceTaper: { value: CONFIG.convergenceTaper },
+    uSegPhases:        { value: segPhaseArray },
 
     // Phasing pills (group A only)
     uPhaseEnabled:    { value: 0 },
@@ -287,6 +320,12 @@ const mat = new THREE.ShaderMaterial({
     uniform float uPhaseSpacing;
     uniform float uPhaseLength;
     uniform float uPhaseHeight;
+    uniform float uConvergenceMode;
+    uniform float uConvergenceTaper;
+    // Per-segment merge phase, one entry per buffer row. 0 = spread,
+    // 1 = fully merged. Sized to match WORLD.bufferSegs (33).
+    uniform float uSegPhases[33];
+
     uniform float uPhaseOffsetA;
     uniform float uPhaseOpacityA;
     uniform vec3  uPhaseColorA;
@@ -399,10 +438,11 @@ const mat = new THREE.ShaderMaterial({
     //   2. composite each lane's color onto the destination using the
     //      chosen blend mode — this is where the layering effect happens
     vec4 drawRailTopology(float wx, float wy) {
-      float halfW = uRailWidth;
+      float baseHalfW = uRailWidth;
       float sig   = max(uRailSigma, 0.05);
       float softK = clamp(uRailSoft, 0.0, 1.0);
       float aa    = max(fwidth(wy), 1e-4);
+      float laneTol = max(uLaneSpacePerUnit * 0.5, 0.5);
 
       float laneCov[MAX_LANE_BUCKETS];
       for (int i = 0; i < MAX_LANE_BUCKETS; i++) laneCov[i] = 0.0;
@@ -413,6 +453,13 @@ const mat = new THREE.ShaderMaterial({
 
       for (int r = 0; r < 33; r++) {
         if (float(r) >= uBufferSegs) break;
+
+        // Phase at the START and END of this segment row. The start phase
+        // is the previous row's end phase (same loop, one step earlier),
+        // so the bend segment smoothly interpolates from spread to merge.
+        float phaseEnd   = uSegPhases[r];
+        float phaseStart = (r > 0) ? uSegPhases[r - 1] : phaseEnd;
+
         for (int s = 0; s < 9; s++) {
           if (float(s) >= uMaxSlots) break;
           vec4 conn = fetchLane(float(s), float(r));
@@ -427,6 +474,15 @@ const mat = new THREE.ShaderMaterial({
           float y2 = conn.b;
           float t  = (wx - sx) / uSegW;
           if (t < 0.0 || t >= 1.0) continue;
+
+          float halfW = baseHalfW;
+          if (uConvergenceMode > 0.5 && uConvergenceTaper > 0.0) {
+            // Width follows the loop phase: full width during spread
+            // segments, narrowed by uConvergenceTaper during merge
+            // segments. Interpolates across bend segments via t.
+            float phase  = mix(phaseStart, phaseEnd, t);
+            halfW = baseHalfW * (1.0 - uConvergenceTaper * phase);
+          }
 
           vec2  edges  = ribbonEdges(y1, y2, t, halfW);
           float yMid   = (edges.x + edges.y) * 0.5;
@@ -546,10 +602,11 @@ const MOD_TARGETS = [
   { key: 'inkTrapAmount',     label: 'Ink trap amt',  min: 0,    max: 400,   step: 1     },
   { key: 'inkTrapWidth',      label: 'Ink trap width',min: 20,   max: 800,   step: 1     },
   { key: 'inkTrapDensity',    label: 'Ink trap dens', min: 0,    max: 1,     step: 0.01  },
-  { key: 'phasePillSpacing',  label: 'Pill spacing',  min: 20,   max: 800,   step: 1     },
-  { key: 'phasePillLength',   label: 'Pill length',   min: 4,    max: 400,   step: 1     },
-  { key: 'phasePillHeight',   label: 'Pill height',   min: 2,    max: 200,   step: 1     },
-  { key: 'phasePillOpacityA', label: 'Pill opacity',  min: 0,    max: 1,     step: 0.01  },
+  { key: 'phasePillSpacing',   label: 'Pill spacing',  min: 20,   max: 800,   step: 1     },
+  { key: 'phasePillLength',    label: 'Pill length',   min: 4,    max: 400,   step: 1     },
+  { key: 'phasePillHeight',    label: 'Pill height',   min: 2,    max: 200,   step: 1     },
+  { key: 'phasePillOpacityA',  label: 'Pill opacity',  min: 0,    max: 1,     step: 0.01  },
+  { key: 'convergenceTaper',   label: 'Merge taper',   min: 0,    max: 1,     step: 0.01  },
 ];
 // Each waveform is a "shape function" 0..1 → 0..1 over one cycle. The
 // stepModulator code lerps min..max by the shape's output. The shape
@@ -750,6 +807,17 @@ function blendModeIdx(name) {
 let _prevSimMode = null;
 
 function applyConfig() {
+  if (CONFIG.simMode === 'convergence' && _prevSimMode !== 'convergence') {
+    if (CONFIG.railWidth   === DEFAULT_CONFIG.railWidth)   CONFIG.railWidth   = 80;
+    if (CONFIG.railSoft    === DEFAULT_CONFIG.railSoft)    CONFIG.railSoft    = 0;
+    if (CONFIG.railSigma   === DEFAULT_CONFIG.railSigma)   CONFIG.railSigma   = 0.2;
+    if (CONFIG.railOpacity === DEFAULT_CONFIG.railOpacity) CONFIG.railOpacity = 1;
+    if (CONFIG.bgColor     === DEFAULT_CONFIG.bgColor)     CONFIG.bgColor     = '#f4f3ea';
+    if (CONFIG.viewZoom    === DEFAULT_CONFIG.viewZoom)    CONFIG.viewZoom    = 0.6;
+    if (CONFIG.segW        === DEFAULT_CONFIG.segW)        CONFIG.segW        = 1500;
+    if (CONFIG.laneSpace   === DEFAULT_CONFIG.laneSpace)   CONFIG.laneSpace   = 216;
+    syncPanelToConfig();
+  }
   if (CONFIG.simMode === 'phasing' && _prevSimMode !== 'phasing') {
     if (CONFIG.railWidth   === DEFAULT_CONFIG.railWidth)   CONFIG.railWidth   = 54;
     if (CONFIG.railSoft    === DEFAULT_CONFIG.railSoft)    CONFIG.railSoft    = 0;
@@ -795,6 +863,9 @@ function _applyConfigCore(skipMinimap) {
   mat.uniforms.uInkTrapWidth.value     = CONFIG.inkTrapWidth;
   mat.uniforms.uInkTrapDirection.value = CONFIG.inkTrapDirection;
 
+  mat.uniforms.uConvergenceMode.value  = (CONFIG.simMode === 'convergence') ? 1 : 0;
+  mat.uniforms.uConvergenceTaper.value = CONFIG.convergenceTaper;
+
   mat.uniforms.uPhaseEnabled.value  = (CONFIG.simMode === 'phasing') ? 1 : 0;
   mat.uniforms.uPhaseSpacing.value  = CONFIG.phasePillSpacing;
   mat.uniforms.uPhaseLength.value   = CONFIG.phasePillLength;
@@ -803,6 +874,7 @@ function _applyConfigCore(skipMinimap) {
   mat.uniforms.uPhaseColorA.value.set(CONFIG.phaseColorA);
 
   SIM.setScript(CONFIG.simScript);
+  SIM.setConvergencePattern(CONFIG.convergencePattern);
   SIM.setLoopSegs(CONFIG.loopSegs);
   SIM.setSegW(CONFIG.segW);
   SIM.setLaneSpace(CONFIG.laneSpace);
@@ -816,12 +888,14 @@ function _applyConfigCore(skipMinimap) {
   renderer.setClearColor(new THREE.Color(CONFIG.bgColor));
 
   // Mode-conditional panel sections — hide knobs that don't apply.
-  const scriptedOnly   = document.getElementById('scripted-only');
-  const proceduralOnly = document.getElementById('procedural-only');
-  const phasingOnly    = document.getElementById('phasing-only');
-  if (scriptedOnly)   scriptedOnly.style.display   = CONFIG.simMode === 'scripted'   ? '' : 'none';
-  if (proceduralOnly) proceduralOnly.style.display = CONFIG.simMode === 'procedural' ? '' : 'none';
-  if (phasingOnly)    phasingOnly.style.display    = CONFIG.simMode === 'phasing'    ? '' : 'none';
+  const scriptedOnly    = document.getElementById('scripted-only');
+  const proceduralOnly  = document.getElementById('procedural-only');
+  const phasingOnly     = document.getElementById('phasing-only');
+  const convergenceOnly = document.getElementById('convergence-only');
+  if (scriptedOnly)    scriptedOnly.style.display    = CONFIG.simMode === 'scripted'    ? '' : 'none';
+  if (proceduralOnly)  proceduralOnly.style.display  = CONFIG.simMode === 'procedural'  ? '' : 'none';
+  if (phasingOnly)     phasingOnly.style.display     = CONFIG.simMode === 'phasing'     ? '' : 'none';
+  if (convergenceOnly) convergenceOnly.style.display = CONFIG.simMode === 'convergence' ? '' : 'none';
 
   if (!skipMinimap) buildMinimap();
 }
