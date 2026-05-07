@@ -103,6 +103,17 @@ const CONFIG = {
   // 0 = constant width; 1 = rail vanishes at the merge.
   convergenceTaper: 0,
 
+  // Topology drawing — when true, dragging in the minimap adds a MERGE
+  // event to the active scripted-mode (or draw-mode) timeline. Click-to-
+  // seek is paused while this is on. Shift-drag adds a SPLIT instead.
+  minimapDrawMode: false,
+  // User-drawn events. In scripted mode they layer on top of the active
+  // preset; in draw mode they ARE the script. Persisted in presets.
+  userEvents: [],
+  // Initial lanes for draw mode (space/comma list of integers). Materialised
+  // as a single INIT event at seg 0 in USER_EVENTS.
+  drawInitLanes: '0 3 6',
+
   // Simulation
   simMode:      'procedural',  // 'scripted' | 'procedural' | 'phasing' | 'convergence'
   simScript:    'v1',
@@ -110,6 +121,8 @@ const CONFIG = {
   seed:         1,
   mergeChance:  0.20,
   splitChance:  0.17,
+  spawnChance:  0.20,
+  endChance:    0.05,
   maxTracks:    9,
 
   // PNG sequence export
@@ -136,6 +149,8 @@ SIM.setCenterY(0);
 SIM.setSeed(CONFIG.seed);
 SIM.setMergeChance(CONFIG.mergeChance);
 SIM.setSplitChance(CONFIG.splitChance);
+SIM.setSpawnChance(CONFIG.spawnChance);
+SIM.setEndChance(CONFIG.endChance);
 SIM.setMaxTracks(CONFIG.maxTracks);
 SIM.setMode(CONFIG.simMode);
 
@@ -186,7 +201,11 @@ laneDataTex.needsUpdate = true;
 // width through the loop's spread→merge→spread cycle, regardless of which
 // rail the conn belongs to.
 const segPhaseArray = new Float32Array(WORLD.bufferSegs);
-const PHASE_MAX_RANGE = 6;   // lanes 0..6 = full spread
+const PHASE_MAX_RANGE   = 6;   // lanes 0..6 = full spread → phase 0
+const PHASE_MERGE_RANGE = 3;   // any range ≤ this counts as "fully
+                               // merged" → phase 1. Keeps width flat
+                               // across stack/unstack within the merged
+                               // zone (e.g. shuffle pattern).
 
 function rebuildLaneData() {
   const segW = CONFIG.segW;
@@ -223,7 +242,9 @@ function rebuildLaneData() {
       segPhaseArray[r] = 0;
     } else {
       const range = yMax - yMin;
-      segPhaseArray[r] = 1 - Math.min(1, range / PHASE_MAX_RANGE);
+      const denom = PHASE_MAX_RANGE - PHASE_MERGE_RANGE;
+      segPhaseArray[r] = Math.max(0, Math.min(1,
+        (PHASE_MAX_RANGE - range) / denom));
     }
   }
   laneDataTex.needsUpdate = true;
@@ -478,10 +499,13 @@ const mat = new THREE.ShaderMaterial({
           float halfW = baseHalfW;
           if (uConvergenceMode > 0.5 && uConvergenceTaper > 0.0) {
             // Width follows the loop phase: full width during spread
-            // segments, narrowed by uConvergenceTaper during merge
-            // segments. Interpolates across bend segments via t.
+            // segments, narrowed during the merge segments. Slider at 1
+            // narrows to MIN_FACTOR (not zero) so rails stay visible
+            // through the merge. Interpolates across bends via t.
+            const float MIN_FACTOR = 0.15;
             float phase  = mix(phaseStart, phaseEnd, t);
-            halfW = baseHalfW * (1.0 - uConvergenceTaper * phase);
+            float factor = mix(1.0, MIN_FACTOR, uConvergenceTaper * phase);
+            halfW = baseHalfW * factor;
           }
 
           vec2  edges  = ribbonEdges(y1, y2, t, halfW);
@@ -607,6 +631,8 @@ const MOD_TARGETS = [
   { key: 'phasePillHeight',    label: 'Pill height',   min: 2,    max: 200,   step: 1     },
   { key: 'phasePillOpacityA',  label: 'Pill opacity',  min: 0,    max: 1,     step: 0.01  },
   { key: 'convergenceTaper',   label: 'Merge taper',   min: 0,    max: 1,     step: 0.01  },
+  { key: 'spawnChance',        label: 'Spawn chance',  min: 0,    max: 1,     step: 0.01  },
+  { key: 'endChance',          label: 'End chance',    min: 0,    max: 1,     step: 0.01  },
 ];
 // Each waveform is a "shape function" 0..1 → 0..1 over one cycle. The
 // stepModulator code lerps min..max by the shape's output. The shape
@@ -863,7 +889,11 @@ function _applyConfigCore(skipMinimap) {
   mat.uniforms.uInkTrapWidth.value     = CONFIG.inkTrapWidth;
   mat.uniforms.uInkTrapDirection.value = CONFIG.inkTrapDirection;
 
-  mat.uniforms.uConvergenceMode.value  = (CONFIG.simMode === 'convergence') ? 1 : 0;
+  mat.uniforms.uConvergenceMode.value  =
+    (CONFIG.simMode === 'convergence'
+      || CONFIG.simMode === 'draw'
+      || CONFIG.simMode === 'procedural'
+      || CONFIG.simMode === 'branching') ? 1 : 0;
   mat.uniforms.uConvergenceTaper.value = CONFIG.convergenceTaper;
 
   mat.uniforms.uPhaseEnabled.value  = (CONFIG.simMode === 'phasing') ? 1 : 0;
@@ -874,6 +904,28 @@ function _applyConfigCore(skipMinimap) {
   mat.uniforms.uPhaseColorA.value.set(CONFIG.phaseColorA);
 
   SIM.setScript(CONFIG.simScript);
+  // Draw mode: the user's INIT lanes are materialised as a single INIT
+  // event at seg 0 in USER_EVENTS. Subsequent SPLIT/MERGE events the user
+  // draws are appended after it.
+  if (CONFIG.simMode === 'draw') {
+    const events = Array.isArray(CONFIG.userEvents) ? CONFIG.userEvents.slice() : [];
+    const noInit = !events.some(e => String(e.type).toUpperCase() === 'INIT');
+    if (noInit) {
+      events.unshift({ seg: 0, type: 'INIT', from: CONFIG.drawInitLanes || '3' });
+    } else {
+      // Keep the INIT in sync with the text input.
+      for (const e of events) {
+        if (String(e.type).toUpperCase() === 'INIT') {
+          e.from = CONFIG.drawInitLanes || '3';
+          break;
+        }
+      }
+    }
+    CONFIG.userEvents = events;
+    SIM.setUserEvents(events);
+  } else if (Array.isArray(CONFIG.userEvents)) {
+    SIM.setUserEvents(CONFIG.userEvents);
+  }
   SIM.setConvergencePattern(CONFIG.convergencePattern);
   SIM.setLoopSegs(CONFIG.loopSegs);
   SIM.setSegW(CONFIG.segW);
@@ -881,6 +933,8 @@ function _applyConfigCore(skipMinimap) {
   SIM.setSeed(CONFIG.seed);
   SIM.setMergeChance(CONFIG.mergeChance);
   SIM.setSplitChance(CONFIG.splitChance);
+  SIM.setSpawnChance(CONFIG.spawnChance);
+  SIM.setEndChance(CONFIG.endChance);
   SIM.setMaxTracks(CONFIG.maxTracks);
   SIM.setMode(CONFIG.simMode);
   rebuildLaneData();
@@ -888,14 +942,19 @@ function _applyConfigCore(skipMinimap) {
   renderer.setClearColor(new THREE.Color(CONFIG.bgColor));
 
   // Mode-conditional panel sections — hide knobs that don't apply.
-  const scriptedOnly    = document.getElementById('scripted-only');
-  const proceduralOnly  = document.getElementById('procedural-only');
-  const phasingOnly     = document.getElementById('phasing-only');
-  const convergenceOnly = document.getElementById('convergence-only');
-  if (scriptedOnly)    scriptedOnly.style.display    = CONFIG.simMode === 'scripted'    ? '' : 'none';
-  if (proceduralOnly)  proceduralOnly.style.display  = CONFIG.simMode === 'procedural'  ? '' : 'none';
-  if (phasingOnly)     phasingOnly.style.display     = CONFIG.simMode === 'phasing'     ? '' : 'none';
-  if (convergenceOnly) convergenceOnly.style.display = CONFIG.simMode === 'convergence' ? '' : 'none';
+  const m = CONFIG.simMode;
+  const setVis = (id, vis) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = vis ? '' : 'none';
+  };
+  setVis('scripted-only',    m === 'scripted');
+  setVis('procedural-only',  m === 'procedural' || m === 'branching');
+  setVis('branching-only',   m === 'branching');
+  setVis('phasing-only',     m === 'phasing');
+  setVis('convergence-only', m === 'convergence');
+  setVis('draw-only',        m === 'draw');
+  setVis('taper-only',       m === 'convergence' || m === 'draw' || m === 'procedural' || m === 'branching');
+  setVis('loop-segs-label',  m === 'scripted' || m === 'draw');
 
   if (!skipMinimap) buildMinimap();
 }
@@ -939,7 +998,7 @@ function buildMinimap() {
     segCount = MM_WINDOW_BEHIND + MM_WINDOW_AHEAD;
   } else {
     segStart = 0;
-    segCount = SIM.LOOP_SEGS;
+    segCount = (CONFIG.simMode === 'convergence') ? SIM.CONV_LOOP : SIM.LOOP_SEGS;
   }
   minimapInfo = { segStart, segCount, isProcedural };
 
@@ -983,8 +1042,127 @@ function buildMinimap() {
   minimapPlayhead.setAttribute('stroke-width', '1.5');
   svg.appendChild(minimapPlayhead);
 
-  // Click-to-seek.
+  // Highlight user-drawn events on top of the preset conns. The script
+  // loops every LOOP_SEGS, so an event at seg N appears at every absolute
+  // segment whose mod-LOOP_SEGS equals N. INIT events are rendered as a
+  // dot per starting lane on the first segment column.
+  const showUserEvents =
+    (CONFIG.simMode === 'scripted' || CONFIG.simMode === 'draw')
+    && SIM.getUserEvents;
+  if (showUserEvents) {
+    const userEvents = SIM.getUserEvents();
+    const loopLen = Math.max(1, SIM.LOOP_SEGS);
+    for (const ev of userEvents) {
+      const type = String(ev.type).toUpperCase();
+      if (type === 'INIT') {
+        // Render INIT lanes as dots in the first visible segment column.
+        const tokens = String(ev.from).replace(/,/g, ' ').split(/\s+/);
+        for (const tok of tokens) {
+          const lane = parseFloat(tok);
+          if (!Number.isFinite(lane)) continue;
+          const cx = mmSegX(0, segCount);
+          const cy = mmLaneY(lane, laneCount);
+          const dot = document.createElementNS(SVG_NS, 'circle');
+          dot.setAttribute('cx', cx);
+          dot.setAttribute('cy', cy);
+          dot.setAttribute('r', 3);
+          dot.setAttribute('fill', 'rgba(255, 200, 80, 0.95)');
+          svg.appendChild(dot);
+        }
+        continue;
+      }
+      const k = ((ev.seg % loopLen) + loopLen) % loopLen;
+      for (let i = 0; i < segCount; i++) {
+        const absSeg = segStart + i;
+        if (((absSeg % loopLen) + loopLen) % loopLen !== k) continue;
+        const x1 = mmSegX(i,     segCount);
+        const x2 = mmSegX(i + 1, segCount);
+        const yA = mmLaneY(parseFloat(ev.from), laneCount);
+        const yB = mmLaneY(parseFloat(ev.to ?? ev.from), laneCount);
+        const path = document.createElementNS(SVG_NS, 'path');
+        path.setAttribute('d', mmCubicPath(x1, yA, x2, yB));
+        path.setAttribute('stroke',
+          type === 'SPLIT' ? 'rgba(120, 220, 255, 0.95)'
+                           : 'rgba(255, 200, 80, 0.95)');
+        path.setAttribute('stroke-width', '2.2');
+        path.setAttribute('fill', 'none');
+        path.setAttribute('stroke-linecap', 'round');
+        svg.appendChild(path);
+      }
+    }
+  }
+
+  // Drag-to-draw — active in scripted (with Draw toggle on) and draw
+  // modes. Maps client (x,y) to integer (seg, lane); commits MERGE on
+  // plain drag, SPLIT on shift-drag. End-segment is forced to start_seg+1
+  // so each drawn line spans exactly one segment.
+  let dragStart = null;
+  let dragShift = false;
+  let ghostPath = null;
+  const pxToSegLane = (clientX, clientY) => {
+    const rect = svg.getBoundingClientRect();
+    const xRel = (clientX - rect.left) / rect.width * MM.W;
+    const yRel = (clientY - rect.top)  / rect.height * MM.H;
+    const segOffset = ((xRel - MM.PAD_X) / (MM.W - 2 * MM.PAD_X)) * segCount;
+    const seg = Math.round(segStart + segOffset);
+    const span = Math.max(1, laneCount - 1);
+    const laneOffset = ((MM.H - MM.PAD_Y - yRel) / (MM.H - 2 * MM.PAD_Y)) * span;
+    const lane = Math.max(0, Math.min(laneCount - 1, Math.round(laneOffset)));
+    return { seg, lane };
+  };
+  const drawingActive = () =>
+    (CONFIG.simMode === 'scripted' && CONFIG.minimapDrawMode)
+    || CONFIG.simMode === 'draw';
+
+  svg.onmousedown = (ev) => {
+    if (!drawingActive() || ev.button !== 0) return;
+    dragStart = pxToSegLane(ev.clientX, ev.clientY);
+    dragShift = !!ev.shiftKey;
+    ev.preventDefault();
+  };
+  svg.onmousemove = (ev) => {
+    if (!dragStart) return;
+    const cur = pxToSegLane(ev.clientX, ev.clientY);
+    const x1 = mmSegX(dragStart.seg - segStart,     segCount);
+    const x2 = mmSegX(dragStart.seg - segStart + 1, segCount);
+    const yA = mmLaneY(dragStart.lane, laneCount);
+    const yB = mmLaneY(cur.lane,       laneCount);
+    if (!ghostPath) {
+      ghostPath = document.createElementNS(SVG_NS, 'path');
+      ghostPath.setAttribute('stroke',
+        dragShift ? 'rgba(120, 220, 255, 0.7)' : 'rgba(255, 200, 80, 0.6)');
+      ghostPath.setAttribute('stroke-width', '2.2');
+      ghostPath.setAttribute('stroke-dasharray', '3 3');
+      ghostPath.setAttribute('fill', 'none');
+      svg.appendChild(ghostPath);
+    }
+    ghostPath.setAttribute('d', mmCubicPath(x1, yA, x2, yB));
+  };
+  const commitDrag = (ev) => {
+    if (!dragStart) return;
+    const end = pxToSegLane(ev.clientX, ev.clientY);
+    if (end.lane !== dragStart.lane) {
+      SIM.addUserEvent({
+        seg:  dragStart.seg,
+        type: dragShift ? 'SPLIT' : 'MERGE',
+        from: dragStart.lane,
+        to:   end.lane,
+      });
+      CONFIG.userEvents = SIM.getUserEvents();
+    }
+    dragStart = null;
+    dragShift = false;
+    if (ghostPath) { ghostPath.remove(); ghostPath = null; }
+    buildMinimap();
+  };
+  svg.onmouseup    = commitDrag;
+  svg.onmouseleave = (ev) => {
+    if (dragStart) commitDrag(ev);
+  };
+
+  // Click-to-seek (suppressed during draw mode so drag doesn't also seek).
   svg.onclick = (ev) => {
+    if (drawingActive()) return;
     const rect = svg.getBoundingClientRect();
     const xRel = (ev.clientX - rect.left) / rect.width * MM.W;
     const segOffset = ((xRel - MM.PAD_X) / (MM.W - 2 * MM.PAD_X)) * segCount;
@@ -993,6 +1171,8 @@ function buildMinimap() {
     const wl = SIM.WORLD_LOOP;
     WORLD.cameraX = Number.isFinite(wl) ? ((newCam % wl) + wl) % wl : Math.max(0, newCam);
   };
+
+  svg.style.cursor = drawingActive() ? 'crosshair' : 'crosshair';
 
   updateMinimapPlayhead();
 }
@@ -1384,6 +1564,24 @@ function bindGlobalControls() {
   const addBtn = document.getElementById('add-modulator');
   if (addBtn) addBtn.addEventListener('click', addModulator);
   rebuildModulatorsList();
+
+  // Minimap draw mode + clear-drawings buttons.
+  const drawToggle = document.getElementById('draw-toggle');
+  if (drawToggle) {
+    drawToggle.checked = !!CONFIG.minimapDrawMode;
+    drawToggle.addEventListener('change', () => {
+      CONFIG.minimapDrawMode = drawToggle.checked;
+      buildMinimap();
+    });
+  }
+  const clearDrawings = document.getElementById('clear-drawings');
+  if (clearDrawings) {
+    clearDrawings.addEventListener('click', () => {
+      SIM.clearUserEvents();
+      CONFIG.userEvents = [];
+      buildMinimap();
+    });
+  }
 
   // Collapse button.
   const toggle = document.getElementById('panel-toggle');

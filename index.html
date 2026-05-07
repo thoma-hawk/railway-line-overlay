@@ -177,6 +177,13 @@
         <h2>Topology</h2>
         <svg id="minimap" width="100%" height="110" viewBox="0 0 600 110"
              style="display:block; border-radius:4px; background:rgba(0,0,0,0.35); cursor:crosshair;"></svg>
+        <div id="minimap-controls" style="display:flex; gap:6px; align-items:center; margin-top:6px;">
+          <label class="mod-toggle" style="flex:0 0 auto;">
+            <input type="checkbox" id="draw-toggle"> Draw
+          </label>
+          <button class="preset-btn" id="clear-drawings"
+                  style="margin-top:0; flex:1;">Clear drawings</button>
+        </div>
       </section>
 
       <section id="pinned-sim">
@@ -195,8 +202,10 @@
           <select data-k="simMode">
             <option value="scripted">Scripted (looping preset)</option>
             <option value="procedural">Procedural (seeded roll)</option>
+            <option value="branching">Branching (procedural + spawn/end)</option>
             <option value="phasing">Phasing (one rail, two pill voices)</option>
             <option value="convergence">Convergence (rail width)</option>
+            <option value="draw">Draw (custom topology)</option>
           </select>
         </label>
         <div id="scripted-only">
@@ -206,8 +215,8 @@
               <option value="v5">v5 — 5-lane splits</option>
             </select>
           </label>
-          <label>Loop segs <input type="range" min="10" max="120" step="1" data-k="loopSegs"><span data-v="loopSegs"></span></label>
         </div>
+        <label id="loop-segs-label">Loop segs <input type="range" min="10" max="120" step="1" data-k="loopSegs"><span data-v="loopSegs"></span></label>
         <label>Segment width <input type="range" min="40" max="8000" step="2" data-k="segW"><span data-v="segW"></span></label>
         <div id="procedural-only" class="sub-block">
           <div class="sub-head">Procedural</div>
@@ -216,6 +225,12 @@
           <label>Merge chance <input type="range" min="0" max="1" step="0.01" data-k="mergeChance"><span data-v="mergeChance"></span></label>
           <label>Split chance <input type="range" min="0" max="1" step="0.01" data-k="splitChance"><span data-v="splitChance"></span></label>
           <label>Max tracks <input type="range" min="1" max="9" step="1" data-k="maxTracks"><span data-v="maxTracks"></span></label>
+        </div>
+        <div id="branching-only" class="sub-block">
+          <div class="sub-head">Branching</div>
+          <label>Spawn chance <input type="range" min="0" max="1" step="0.01" data-k="spawnChance"><span data-v="spawnChance"></span></label>
+          <label>End chance <input type="range" min="0" max="1" step="0.01" data-k="endChance"><span data-v="endChance"></span></label>
+          <div class="preset-hint">Per-segment chance a new rail spawns with a stub-entry from the top/bottom edge. Per-rail per-segment chance an existing rail terminates with a stub-exit to an edge.</div>
         </div>
         <div id="convergence-only" class="sub-block">
           <div class="sub-head">Convergence</div>
@@ -226,10 +241,20 @@
               <option value="swap">Swap (yellow ↔ red, touching)</option>
               <option value="gap">Gap (top pair touching, bottom isolated)</option>
               <option value="inverted">Inverted (top ↔ bottom)</option>
+              <option value="weave">Weave (cross over while stacking)</option>
+              <option value="braid">Braid (continuous crossing in narrow zone)</option>
+              <option value="shuffle">Shuffle (split/merge while narrow)</option>
             </select>
           </label>
+        </div>
+        <div id="taper-only" class="sub-block">
           <label>Merge taper <input type="range" min="0" max="1" step="0.01" data-k="convergenceTaper"><span data-v="convergenceTaper"></span></label>
-          <div class="preset-hint">Patterns place rails at fixed sub-lane positions at the merge. Merge taper narrows all rails through the merged phase of the loop (0 = constant width, 1 = vanishes at merge).</div>
+          <div class="preset-hint">Narrows rails through the merged phase of the loop (0 = constant width, 1 = ≈15% width at merge).</div>
+        </div>
+        <div id="draw-only" class="sub-block">
+          <div class="sub-head">Draw</div>
+          <label>Init lanes <input type="text" data-k="drawInitLanes" placeholder="e.g. 0 3 6" style="width:120px"></label>
+          <div class="preset-hint">Drag in the topology to add a <b>MERGE</b> (relocate an existing rail). Hold ⇧&nbsp;Shift while dragging to add a <b>SPLIT</b> (spawn a new rail). The loop length is set by <i>Loop segs</i>.</div>
         </div>
         <div id="phasing-only" class="sub-block">
           <div class="sub-head">Phasing pills</div>
@@ -346,7 +371,7 @@
   <!-- JSZip — used as a fallback when the File System Access API isn't
        available (Firefox / Safari) so the export bundles into one .zip. -->
   <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script src="sim.js?v=18"></script>
-  <script src="app-three.js?v=18"></script>
+  <script src="sim.js?v=31"></script>
+  <script src="app-three.js?v=31"></script>
 </body>
 </html>

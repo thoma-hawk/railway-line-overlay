@@ -93,14 +93,105 @@ const SIM = (() => {
       { seg: 16, type: 'MERGE', from: 4, to: 0 },
       { seg: 16, type: 'MERGE', from: 2, to: 6 },
     ],
+    // Tight sub-lane stack at centre with order reversed — top rail goes
+    // to the bottom of the stack, bottom rail to the top, so the ribbons
+    // cross over each other while overlapping at centre.
+    weave: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 0, to: 3.2 },
+      { seg: 8,  type: 'MERGE', from: 3, to: 3.0 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 2.8 },
+      { seg: 16, type: 'MERGE', from: 3.2, to: 0 },
+      { seg: 16, type: 'MERGE', from: 3.0, to: 3 },
+      { seg: 16, type: 'MERGE', from: 2.8, to: 6 },
+    ],
+    // Long, varied braid section — outer rails repeatedly cross at
+    // irregular intervals and varying widths, middle rail drifts around
+    // sub-lane offsets. Loop is 48 segments (declared in CONV_LOOPS) so
+    // the merged zone occupies segs 8–40 (~33 segs of variation).
+    braid: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      // Bend in.
+      { seg: 8,  type: 'MERGE', from: 0, to: 3.2 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 2.8 },
+      // Wide cross — outer rails fan to ±0.4.
+      { seg: 10, type: 'MERGE', from: 3.2, to: 2.6 },
+      { seg: 10, type: 'MERGE', from: 2.8, to: 3.4 },
+      { seg: 11, type: 'MERGE', from: 3,   to: 2.85 },
+      // Pull back to medium cross, swapping order again.
+      { seg: 13, type: 'MERGE', from: 2.6, to: 3.3 },
+      { seg: 13, type: 'MERGE', from: 3.4, to: 2.7 },
+      { seg: 15, type: 'MERGE', from: 2.85, to: 3.15 },
+      // Wider still.
+      { seg: 17, type: 'MERGE', from: 3.3, to: 2.5 },
+      { seg: 17, type: 'MERGE', from: 2.7, to: 3.5 },
+      // Tight cross with middle drift.
+      { seg: 19, type: 'MERGE', from: 2.5, to: 3.4 },
+      { seg: 19, type: 'MERGE', from: 3.5, to: 2.6 },
+      { seg: 19, type: 'MERGE', from: 3.15, to: 2.95 },
+      // Medium swap.
+      { seg: 22, type: 'MERGE', from: 3.4, to: 2.7 },
+      { seg: 22, type: 'MERGE', from: 2.6, to: 3.3 },
+      { seg: 24, type: 'MERGE', from: 2.95, to: 3.05 },
+      // Tight cross — outer rails close in.
+      { seg: 26, type: 'MERGE', from: 2.7, to: 3.4 },
+      { seg: 26, type: 'MERGE', from: 3.3, to: 2.6 },
+      { seg: 28, type: 'MERGE', from: 3.05, to: 2.85 },
+      // Medium swap.
+      { seg: 30, type: 'MERGE', from: 3.4, to: 2.7 },
+      { seg: 30, type: 'MERGE', from: 2.6, to: 3.3 },
+      // Outer rails fan out, middle returns to centre.
+      { seg: 32, type: 'MERGE', from: 2.7, to: 2.5 },
+      { seg: 32, type: 'MERGE', from: 3.3, to: 3.5 },
+      { seg: 32, type: 'MERGE', from: 2.85, to: 3 },
+      // Final cross.
+      { seg: 34, type: 'MERGE', from: 2.5, to: 3.3 },
+      { seg: 34, type: 'MERGE', from: 3.5, to: 2.7 },
+      // Settle to weave-end positions for clean bend-out.
+      { seg: 36, type: 'MERGE', from: 3.3, to: 3.2 },
+      { seg: 36, type: 'MERGE', from: 2.7, to: 2.8 },
+      // Bend out.
+      { seg: 40, type: 'MERGE', from: 3.2, to: 0 },
+      { seg: 40, type: 'MERGE', from: 2.8, to: 6 },
+    ],
+    // Bends down to the adjacent stack (narrow) and then stacks/unstacks
+    // twice while still narrow before bending back. Demonstrates merge
+    // and split events happening at the smaller, tapered rail width.
+    shuffle: [
+      { seg: 0,  type: 'INIT',  from: '0 3 6' },
+      { seg: 8,  type: 'MERGE', from: 0, to: 2 },
+      { seg: 8,  type: 'MERGE', from: 6, to: 4 },
+      { seg: 10, type: 'MERGE', from: 2, to: 3 },
+      { seg: 10, type: 'MERGE', from: 4, to: 3 },
+      { seg: 12, type: 'MERGE', from: 3, to: 2 },
+      { seg: 12, type: 'MERGE', from: 3, to: 4 },
+      { seg: 14, type: 'MERGE', from: 2, to: 3 },
+      { seg: 14, type: 'MERGE', from: 4, to: 3 },
+      { seg: 15, type: 'MERGE', from: 3, to: 2 },
+      { seg: 15, type: 'MERGE', from: 3, to: 4 },
+      { seg: 16, type: 'MERGE', from: 2, to: 0 },
+      { seg: 16, type: 'MERGE', from: 4, to: 6 },
+    ],
   };
+  // Per-pattern loop length. Patterns not listed here use DEFAULT_CONV_LOOP.
+  const CONV_LOOPS = {
+    braid: 48,
+  };
+  const DEFAULT_CONV_LOOP = 24;
   let CONV_SCRIPT = CONV_PATTERNS.adjacent;
-  const CONV_LOOP = 24;
+  let CONV_LOOP = DEFAULT_CONV_LOOP;
+
+  // User-drawn events appended to the active scripted-mode timeline.
+  // Same shape as ACTIVE entries: { seg, type, from, to }. Persist across
+  // script changes so a v1↔v5 swap doesn't wipe the user's drawings.
+  let USER_EVENTS = [];
 
   let MODE = 'scripted';
 
   let MERGE_CHANCE = 0.4;
   let SPLIT_CHANCE = 0.9;
+  let SPAWN_CHANCE = 0.2;   // branching-mode rail spawn (edge entry)
+  let END_CHANCE   = 0.05;
   let MAX_TRACKS   = 7;
   let SEED         = 1;
 
@@ -145,7 +236,9 @@ const SIM = (() => {
   // else default to lane 3 (or last lane if LANE_COUNT < 4).
   function initialRails() {
     const lanes = [];
-    const list = (MODE === 'convergence') ? CONV_SCRIPT : ACTIVE;
+    const list = (MODE === 'convergence') ? CONV_SCRIPT
+               : (MODE === 'draw')        ? USER_EVENTS
+               : ACTIVE;
     const init = list.find(e => String(e.type).toUpperCase() === 'INIT');
     if (init) {
       for (const tok of String(init.from).replace(/,/g, ' ').split(/\s+/)) {
@@ -168,7 +261,7 @@ const SIM = (() => {
     return b;
   }
   function bucketEvents() {
-    return bucketEventsFromList(ACTIVE, LOOP_SEGS);
+    return bucketEventsFromList(ACTIVE.concat(USER_EVENTS), LOOP_SEGS);
   }
 
   // ── Step segment for scripted mode ───────────────────────────────────────
@@ -283,6 +376,54 @@ const SIM = (() => {
     return { conns, endRails };
   }
 
+  // ── Step segment for branching mode ──────────────────────────────────────
+  // Like procedural, but rails can also END (dead-end stub) and new spawns
+  // enter from an edge lane (top or bottom). Visually models the shapes in
+  // svg/dead-end.svg and svg/new-spawns.svg — rails fade in/out of the
+  // lane grid through diagonal stubs at the edges.
+  //
+  // END_CHANCE — per-rail per-segment chance the rail terminates.
+  function generateLogicBranchingRails(rails) {
+    const conns    = [];
+    const endRails = [];
+    const edge     = () => (rng() < 0.5) ? 0 : (LANE_COUNT - 1);
+
+    // Per-rail walk + end roll. A rail that ends emits a stub-exit conn
+    // (current lane → edge lane) and is dropped from endRails.
+    for (const rail of rails) {
+      if (rng() < END_CHANCE) {
+        conns.push({ id: rail.id, y1: rail.lane, y2: edge() });
+        continue;
+      }
+      const r = rng();
+      let nextLane = rail.lane;
+      if (r < MERGE_CHANCE * 0.5) {
+        if (rail.lane > 0) nextLane = rail.lane - 1;
+      } else if (r < MERGE_CHANCE) {
+        if (rail.lane < LANE_COUNT - 1) nextLane = rail.lane + 1;
+      }
+      conns.push({ id: rail.id, y1: rail.lane, y2: nextLane });
+      endRails.push({ id: rail.id, lane: nextLane });
+    }
+
+    // Per-segment spawn roll — new rail enters from an edge lane and
+    // bends in to a random target lane.
+    if (rng() < SPAWN_CHANCE
+        && endRails.length < MAX_TRACKS
+        && endRails.length < MAX_RAILS) {
+      const usedIds = new Set(endRails.map(r => r.id));
+      const newId = nextAvailableId(usedIds);
+      if (newId !== -1) {
+        const fromLane = edge();
+        const toLane   = Math.floor(rng() * LANE_COUNT);
+        conns.push({ id: newId, y1: fromLane, y2: toLane });
+        endRails.push({ id: newId, lane: toLane });
+      }
+    }
+
+    return { conns, endRails };
+  }
+
   // ── Unified rolling cache ────────────────────────────────────────────────
   // Both modes use a single forward-growing cache. STATE.rails[n] holds the
   // rail list at the *start* of segment n; STATE.conns[n] holds the conns
@@ -298,15 +439,23 @@ const SIM = (() => {
 
   function stateKey() {
     if (MODE === 'scripted') {
-      return `s|${LOOP_SEGS}|${LANE_COUNT}|${ACTIVE.map(e =>
+      const evs = ACTIVE.concat(USER_EVENTS);
+      return `s|${LOOP_SEGS}|${LANE_COUNT}|${evs.map(e =>
         `${e.seg},${String(e.type).toUpperCase()},${e.from},${e.to ?? ''}`).join(';')}`;
     }
     if (MODE === 'phasing') {
       return `h|${LANE_COUNT}`;
     }
     if (MODE === 'convergence') {
-      return `c|${LANE_COUNT}|${CONV_SCRIPT.map(e =>
+      return `c|${LANE_COUNT}|${CONV_LOOP}|${CONV_SCRIPT.map(e =>
         `${e.seg},${String(e.type).toUpperCase()},${e.from},${e.to ?? ''}`).join(';')}`;
+    }
+    if (MODE === 'draw') {
+      return `d|${LOOP_SEGS}|${LANE_COUNT}|${USER_EVENTS.map(e =>
+        `${e.seg},${String(e.type).toUpperCase()},${e.from},${e.to ?? ''}`).join(';')}`;
+    }
+    if (MODE === 'branching') {
+      return `b|${LANE_COUNT}|${SEED}|${MERGE_CHANCE}|${SPAWN_CHANCE}|${END_CHANCE}|${MAX_TRACKS}`;
     }
     return `p|${LANE_COUNT}|${SEED}|${MERGE_CHANCE}|${SPLIT_CHANCE}|${MAX_TRACKS}`;
   }
@@ -317,9 +466,10 @@ const SIM = (() => {
     STATE.length = 0;
     STATE.keyParams = stateKey();
     STATE._lastEnd = null;
-    STATE._eventBuckets = (MODE === 'scripted') ? bucketEvents()
-                       : (MODE === 'convergence') ? bucketEventsFromList(CONV_SCRIPT, CONV_LOOP)
-                       : null;
+    STATE._eventBuckets = (MODE === 'scripted')    ? bucketEvents()
+                        : (MODE === 'convergence') ? bucketEventsFromList(CONV_SCRIPT, CONV_LOOP)
+                        : (MODE === 'draw')        ? bucketEventsFromList(USER_EVENTS, LOOP_SEGS)
+                        : null;
     rngReset(SEED);
   }
 
@@ -346,6 +496,34 @@ const SIM = (() => {
         // spread back). Renderer scales width by per-conn end-lane density.
         const events = STATE._eventBuckets[mod(STATE.length, CONV_LOOP)] || [];
         result = stepSegmentRails(startRails, events);
+      } else if (MODE === 'branching') {
+        result = generateLogicBranchingRails(startRails);
+      } else if (MODE === 'draw') {
+        // User-drawn topology. Same engine as scripted, but the script is
+        // entirely USER_EVENTS — INIT, SPLITs, MERGEs all from the user.
+        const inLoopSeg = mod(STATE.length, LOOP_SEGS);
+        const events = STATE._eventBuckets[inLoopSeg] || [];
+        result = stepSegmentRails(startRails, events);
+        // On the last segment of the loop, bend each INIT-spawned rail
+        // back to its starting lane so the next iteration begins from
+        // the same state. Without this the loop visibly stalls — MERGE
+        // events on iteration 2 find no rail at the original `from`
+        // lanes and become no-ops. SPLIT-spawned rails are left alone.
+        if (inLoopSeg === LOOP_SEGS - 1) {
+          const init = initialRails();
+          const homeById = new Map(init.map(r => [r.id, r.lane]));
+          const newConns = result.conns.map(c => {
+            if (homeById.has(c.id)) {
+              return { id: c.id, y1: c.y1, y2: homeById.get(c.id) };
+            }
+            return c;
+          });
+          const newEnd = result.endRails.map(r => {
+            if (homeById.has(r.id)) return { id: r.id, lane: homeById.get(r.id) };
+            return r;
+          });
+          result = { conns: newConns, endRails: newEnd };
+        }
       } else {
         result = generateLogicProceduralRails(startRails);
       }
@@ -395,6 +573,7 @@ const SIM = (() => {
   function setConvergencePattern(n) {
     if (CONV_PATTERNS[n] && CONV_SCRIPT !== CONV_PATTERNS[n]) {
       CONV_SCRIPT = CONV_PATTERNS[n];
+      CONV_LOOP   = CONV_LOOPS[n] || DEFAULT_CONV_LOOP;
       stateReset();
     }
   }
@@ -407,19 +586,47 @@ const SIM = (() => {
     const mm = (m === 'procedural')  ? 'procedural'
              : (m === 'phasing')     ? 'phasing'
              : (m === 'convergence') ? 'convergence'
+             : (m === 'branching')   ? 'branching'
+             : (m === 'draw')        ? 'draw'
              : 'scripted';
     if (MODE !== mm) { MODE = mm; stateReset(); }
   }
   function setSeed(s)          { SEED = (s >>> 0) || 1; stateReset(); }
   function setMergeChance(c)   { MERGE_CHANCE = Math.max(0, Math.min(1, +c)); stateReset(); }
   function setSplitChance(c)   { SPLIT_CHANCE = Math.max(0, Math.min(1, +c)); stateReset(); }
+  function setSpawnChance(c)   { SPAWN_CHANCE = Math.max(0, Math.min(1, +c)); stateReset(); }
+  function setEndChance(c)     { END_CHANCE   = Math.max(0, Math.min(1, +c)); stateReset(); }
   function setMaxTracks(n)     { MAX_TRACKS = Math.max(1, n | 0); stateReset(); }
   function reroll()            { stateReset(); }
+
+  function addUserEvent(ev) {
+    if (!ev || !ev.type) return;
+    USER_EVENTS.push({
+      seg:  ev.seg | 0,
+      type: String(ev.type).toUpperCase(),
+      from: ev.from,
+      to:   ev.to,
+    });
+    stateReset();
+  }
+  function setUserEvents(evs) {
+    USER_EVENTS = Array.isArray(evs) ? evs.slice() : [];
+    stateReset();
+  }
+  function clearUserEvents() {
+    if (USER_EVENTS.length === 0) return;
+    USER_EVENTS = [];
+    stateReset();
+  }
+  function getUserEvents() {
+    return USER_EVENTS.slice();
+  }
 
   return {
     SCRIPTS,
     MAX_RAILS,
     get LOOP_SEGS() { return LOOP_SEGS; },
+    get CONV_LOOP() { return CONV_LOOP; },
     get SEG_W()     { return SEG_W; },
     get CENTER_Y()  { return CENTER_Y; },
     get LANE_SPACE(){ return LANE_SPACE; },
@@ -432,13 +639,16 @@ const SIM = (() => {
     get SEED()      { return SEED; },
     get MERGE_CHANCE() { return MERGE_CHANCE; },
     get SPLIT_CHANCE() { return SPLIT_CHANCE; },
+    get SPAWN_CHANCE() { return SPAWN_CHANCE; },
+    get END_CHANCE()   { return END_CHANCE; },
     get MAX_TRACKS()   { return MAX_TRACKS; },
     laneToY,
     activeLanesAt, connectionsAt, stationWeight, ownerLane,
     smoothstep,
     setScript, setLoopSegs, setSegW, setCenterY, setLaneSpace, setLaneCount,
-    setMode, setSeed, setMergeChance, setSplitChance, setMaxTracks, reroll,
+    setMode, setSeed, setMergeChance, setSplitChance, setSpawnChance, setEndChance, setMaxTracks, reroll,
     setConvergencePattern,
     CONV_PATTERN_KEYS: Object.keys(CONV_PATTERNS),
+    addUserEvent, setUserEvents, clearUserEvents, getUserEvents,
   };
 })();
